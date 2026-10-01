@@ -1,0 +1,15 @@
+set(CMAKE_SYSTEM_NAME Generic)
+set(CMAKE_SYSTEM_PROCESSOR wasm32)
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+
+if(DEFINED ENV{WASI_CLANG})
+    set(CMAKE_C_COMPILER "$ENV{WASI_CLANG}")
+elseif(EXISTS "/opt/homebrew/opt/llvm/bin/clang")
+    set(CMAKE_C_COMPILER "/opt/homebrew/opt/llvm/bin/clang")
+else()
+    find_program(CMAKE_C_COMPILER clang REQUIRED)
+endif()
+
+set(CMAKE_C_COMPILER_TARGET wasm32-wasip1)
+set(CMAKE_CXX_COMPILER "${CMAKE_C_COMPILER}++")
+set(CMAKE_CXX_COMPILER_TARGET wasm32-wasip1)

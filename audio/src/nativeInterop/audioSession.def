@@ -1,0 +1,4 @@
+language = Objective-C
+headers = audio_session.h
+headerFilter = audio_session.h
+package = com.tap.zoot.audio.session

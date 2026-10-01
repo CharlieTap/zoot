@@ -1,0 +1,13 @@
+Control legends use subsets of the Android reference emulator's fonts:
+
+Roboto: Copyright 2011 Google Inc. All Rights Reserved.
+Licensed under Apache License 2.0 (APACHE-2.0.txt).
+Static instances: wght 700 and 500, wdth 100, ital 0; ASCII subset.
+
+Noto Sans Symbols: Copyright 2013 Google Inc. All Rights Reserved.
+Licensed under the SIL Open Font License 1.1 (OFL.txt).
+Subset: U+25B2, U+25BC, U+25C0, U+25B6.
+
+Both sources are from the Android 16 Google APIs emulator system image.
+The subsets preserve the source outlines and metrics. They pin the Android
+control legends across platforms; they do not replace the app's UI font.

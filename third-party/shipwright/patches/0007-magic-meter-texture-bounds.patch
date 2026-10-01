@@ -1,0 +1,28 @@
+Subject: Load only the available magic-meter fill rows.
+
+Upstream-Status: Required for separately allocated extracted textures.
+
+The resource is 8x8 IA8 (64 bytes), read here as 16x8 I4. Loading
+16x16 reads 64 bytes past its allocation. The HUD only draws seven rows.
+
+diff --git a/soh/src/code/z_parameter.c b/soh/src/code/z_parameter.c
+--- a/soh/src/code/z_parameter.c
++++ b/soh/src/code/z_parameter.c
+@@ -3580,7 +3580,7 @@ void Magic_DrawMeter(PlayState* play) {
+             gDPSetPrimColor(OVERLAY_DISP++, 0, 0, magicbar_yellow.r, magicbar_yellow.g, magicbar_yellow.b,
+                             interfaceCtx->magicAlpha);
+ 
+-            gDPLoadMultiBlock_4b(OVERLAY_DISP++, gMagicMeterFillTex, 0, G_TX_RENDERTILE, G_IM_FMT_I, 16, 16, 0,
++            gDPLoadMultiBlock_4b(OVERLAY_DISP++, gMagicMeterFillTex, 0, G_TX_RENDERTILE, G_IM_FMT_I, 16, 8, 0,
+                                  G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOMASK,
+                                  G_TX_NOLOD, G_TX_NOLOD);
+ 
+@@ -3615,7 +3615,7 @@ void Magic_DrawMeter(PlayState* play) {
+                                 interfaceCtx->magicAlpha);
+             }
+ 
+-            gDPLoadMultiBlock_4b(OVERLAY_DISP++, gMagicMeterFillTex, 0, G_TX_RENDERTILE, G_IM_FMT_I, 16, 16, 0,
++            gDPLoadMultiBlock_4b(OVERLAY_DISP++, gMagicMeterFillTex, 0, G_TX_RENDERTILE, G_IM_FMT_I, 16, 8, 0,
+                                  G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOMASK,
+                                  G_TX_NOLOD, G_TX_NOLOD);
+ 

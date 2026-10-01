@@ -1,0 +1,4 @@
+headers = oot_gpu.h
+package = com.tap.zoot.graphics.native
+staticLibraries = libootgpu.a libwgpu_native.a
+linkerOpts = -lc++ -framework Metal -framework QuartzCore -framework Foundation

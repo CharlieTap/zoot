@@ -1,0 +1,801 @@
+Subject: Preserve Zoot game integration and compatibility changes.
+
+Upstream-Status: Zoot-specific; captured from the existing working source.
+
+diff --git a/soh/soh/Enhancements/cosmetics/CustomLogoTitle.cpp b/soh/soh/Enhancements/cosmetics/CustomLogoTitle.cpp
+index f544e8e..024051a 100644
+--- a/soh/soh/Enhancements/cosmetics/CustomLogoTitle.cpp
++++ b/soh/soh/Enhancements/cosmetics/CustomLogoTitle.cpp
+@@ -8,6 +8,8 @@
+ #include "soh_assets.h"
+ #include "soh/cvar_prefixes.h"
+ 
++#include <cstdlib>
++
+ extern "C" {
+ #include "z64.h"
+ #include "macros.h"
+@@ -177,6 +179,9 @@ extern "C" void CustomLogoTitle_Main(TitleContext* titleContext) {
+ //
+ 
+ void OnZTitleInitReplaceTitleMainWithCustom(void* gameState) {
++    if (std::getenv("OOT_FAST3D_REFERENCE_ORIGINAL_TITLE") != nullptr) {
++        return;
++    }
+     TitleContext* titleContext = (TitleContext*)gameState;
+     titleContext->state.main = (GameStateFunc)CustomLogoTitle_Main;
+ }
+diff --git a/soh/src/buffers/heaps.c b/soh/src/buffers/heaps.c
+index de81705..17db70a 100644
+--- a/soh/src/buffers/heaps.c
++++ b/soh/src/buffers/heaps.c
+@@ -13,6 +13,12 @@ u8* gAudioHeap;
+ u8* gSystemHeap;
+ 
+ void Heaps_Alloc(void) {
++#ifdef OOT_WASM_GUEST
++    static u8 audioHeap[AUDIO_HEAP_SIZE] __attribute__((aligned(16)));
++    static u8 systemHeap[SYSTEM_HEAP_SIZE] __attribute__((aligned(16)));
++    gAudioHeap = audioHeap;
++    gSystemHeap = systemHeap;
++#else
+ #ifdef _MSC_VER
+     gAudioHeap = (u8*)_aligned_malloc(AUDIO_HEAP_SIZE, 0x10);
+     gSystemHeap = (u8*)_aligned_malloc(SYSTEM_HEAP_SIZE, 0x10);
+@@ -28,9 +34,11 @@ void Heaps_Alloc(void) {
+ 
+     assert(gAudioHeap != NULL);
+     assert(gSystemHeap != NULL);
++#endif
+ }
+ 
+ void Heaps_Free(void) {
++#ifndef OOT_WASM_GUEST
+ #ifdef _MSC_VER
+     _aligned_free(gAudioHeap);
+     _aligned_free(gSystemHeap);
+@@ -38,4 +46,5 @@ void Heaps_Free(void) {
+     free(gAudioHeap);
+     free(gSystemHeap);
+ #endif
++#endif
+ }
+diff --git a/soh/src/code/code_800E4FE0.c b/soh/src/code/code_800E4FE0.c
+index 3d6c9c5..d8a6dc3 100644
+--- a/soh/src/code/code_800E4FE0.c
++++ b/soh/src/code/code_800E4FE0.c
+@@ -38,6 +38,11 @@ AudioTask* func_800E4FE0(void) {
+ extern u64 rspAspMainDataStart[];
+ extern u64 rspAspMainDataEnd[];
+ 
++#ifdef OOT_WASM_GUEST
++__attribute__((import_module("oot_audio"), import_name("submit_pcm")))
++int32_t Host_SubmitPcm(s16* samples, uint32_t sampleFrames, uint32_t sampleRate);
++#endif
++
+ void AudioMgr_CreateNextAudioBuffer(s16* samples, u32 num_samples) {
+     OSMesg sp4C;
+ 
+@@ -68,6 +73,9 @@ void AudioMgr_CreateNextAudioBuffer(s16* samples, u32 num_samples) {
+     }
+     s32 writtenCmds;
+     AudioSynth_Update(gAudioContext.curAbiCmdBuf, &writtenCmds, samples, num_samples);
++#ifdef OOT_WASM_GUEST
++    Host_SubmitPcm(samples, num_samples, gAudioContext.audioBufferParameters.frequency);
++#endif
+     gAudioContext.audioRandom = (gAudioContext.audioRandom + gAudioContext.totalTaskCnt) * osGetCount();
+ }
+ 
+diff --git a/soh/src/code/game.c b/soh/src/code/game.c
+index 8505d5e..22a9221 100644
+--- a/soh/src/code/game.c
++++ b/soh/src/code/game.c
+@@ -1,5 +1,12 @@
+ #include <string.h>
+ #include "global.h"
++#ifdef OOT_WASM_GUEST
++#include "oot_guest.h"
++#endif
++#ifdef OOT_WASM_DIAGNOSTICS
++__attribute__((import_module("oot_diagnostics"), import_name("checkpoint")))
++void OotDiagnostics_Checkpoint(s32 stage, s32 value);
++#endif
+ #include "vt.h"
+ #include <libultraship/bridge/resourcebridge.h>
+ #include "soh/Enhancements/game-interactor/GameInteractor.h"
+@@ -269,8 +276,14 @@ void GameState_Update(GameState* gameState) {
+     GameInteractor_ExecuteOnGameStateMainStart();
+ 
+     gameState->main(gameState);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(90, 0);
++#endif
+ 
+     func_800C4344(gameState);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(91, 0);
++#endif
+ 
+     if (SREG(63) == 1u) {
+         if (SREG(48) < 0) {
+@@ -341,10 +354,20 @@ void GameState_Update(GameState* gameState) {
+ 
+     if (R_PAUSE_MENU_MODE != 2u) {
+         GameState_Draw(gameState, gfxCtx);
++#ifdef OOT_WASM_DIAGNOSTICS
++        OotDiagnostics_Checkpoint(92, 0);
++#endif
+         func_800C49F4(gfxCtx);
++#ifdef OOT_WASM_DIAGNOSTICS
++        OotDiagnostics_Checkpoint(93, 0);
++#endif
+     }
+ 
++#ifdef OOT_WASM_GUEST
++    gSaveContext.language = OotGuest_GetLanguage();
++#else
+     gSaveContext.language = CVarGetInteger(CVAR_SETTING("Languages"), LANGUAGE_ENG);
++#endif
+ 
+     if (gSaveContext.language == LANGUAGE_JPN && sJpnMessageEntryTablePtr == NULL) {
+         gSaveContext.language = LANGUAGE_ENG;
+@@ -356,6 +379,9 @@ void GameState_Update(GameState* gameState) {
+ 
+     GameInteractor_ExecuteOnGameFrameUpdate();
+     gameState->frames++;
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(94, gameState->frames);
++#endif
+ }
+ 
+ void GameState_InitArena(GameState* gameState, size_t size) {
+@@ -413,6 +439,10 @@ void GameState_Init(GameState* gameState, GameStateFunc init, GraphicsContext* g
+     OSTime startTime;
+     OSTime endTime;
+ 
++#ifdef OOT_WASM_GUEST
++    gSaveContext.language = OotGuest_GetLanguage();
++#endif
++
+     osSyncPrintf("game コンストラクタ開始\n"); // "game constructor start"
+     gameState->gfxCtx = gfxCtx;
+     gameState->frames = 0;
+@@ -465,9 +495,13 @@ void GameState_Init(GameState* gameState, GameStateFunc init, GraphicsContext* g
+ 
+ void GameState_Destroy(GameState* gameState) {
+     osSyncPrintf("game デストラクタ開始\n"); // "game destructor start"
++#ifndef OOT_WASM_GUEST
+     func_800C3C20();
++#endif
++#ifndef OOT_WASM_GUEST
+     Audio_Update();
+     osRecvMesg(&gameState->gfxCtx->queue, NULL, OS_MESG_BLOCK);
++#endif
+     LOG_CHECK_NULL_POINTER("this->cleanup", gameState->destroy);
+     if (gameState->destroy != NULL) {
+         gameState->destroy(gameState);
+diff --git a/soh/src/code/graph.c b/soh/src/code/graph.c
+index 4190955..adc30c5 100644
+--- a/soh/src/code/graph.c
++++ b/soh/src/code/graph.c
+@@ -1,4 +1,8 @@
+ #include "global.h"
++#ifdef OOT_WASM_DIAGNOSTICS
++__attribute__((import_module("oot_diagnostics"), import_name("checkpoint")))
++void OotDiagnostics_Checkpoint(s32 stage, s32 value);
++#endif
+ #include "vt.h"
+ #include "regs.h"
+ 
+@@ -275,6 +279,11 @@ void Graph_TaskSet00(GraphicsContext* gfxCtx) {
+ void Graph_Update(GraphicsContext* gfxCtx, GameState* gameState) {
+     u32 problem;
+ 
++#ifndef OOT_WASM_GUEST
++    extern void OotReferenceBeginFrame(void);
++    OotReferenceBeginFrame();
++#endif
++
+     // Skip game frame updates while gfx debugger is active, and execute with the last frame's DL buffer
+     if (GfxDebuggerIsDebugging()) {
+         Graph_ProcessGfxCommands(runFrameContext.gfxCtx.workBuffer);
+@@ -295,6 +304,9 @@ void Graph_Update(GraphicsContext* gfxCtx, GameState* gameState) {
+ 
+     GameState_ReqPadData(gameState);
+     GameState_Update(gameState);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(95, gameState->frames);
++#endif
+ 
+     OPEN_DISPS(gfxCtx);
+ 
+@@ -384,12 +396,16 @@ void Graph_Update(GraphicsContext* gfxCtx, GameState* gameState) {
+     }
+ 
+     if (!problem) {
++#ifndef OOT_WASM_GUEST
+         Graph_TaskSet00(gfxCtx);
++#endif
+         gfxCtx->gfxPoolIdx++;
+         gfxCtx->fbIdx++;
+     }
+ 
++#ifndef OOT_WASM_GUEST
+     Audio_Update();
++#endif
+ 
+     {
+         OSTime time = osGetTime();
+@@ -425,6 +441,9 @@ void Graph_Update(GraphicsContext* gfxCtx, GameState* gameState) {
+         SET_NEXT_GAMESTATE(gameState, PreNMI_Init, PreNMIContext);
+         gameState->running = false;
+     }
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(96, gameState->frames);
++#endif
+ }
+ 
+ uint64_t GetFrequency();
+@@ -438,6 +457,7 @@ static void RunFrame() {
+     u32 size;
+     char faultMsg[0x50];
+ 
++
+     switch (runFrameContext.state) {
+         case 0:
+             break;
+@@ -473,9 +493,10 @@ static void RunFrame() {
+             // uint64_t ticksA, ticksB;
+             // ticksA = GetPerfCounter();
+ 
++#ifndef OOT_WASM_GUEST
+             Graph_StartFrame();
+-
+             PadMgr_ThreadEntry(&gPadMgr);
++#endif
+ 
+             Graph_Update(&runFrameContext.gfxCtx, gGameState);
+             // ticksB = GetPerfCounter();
+@@ -489,7 +510,9 @@ static void RunFrame() {
+             // uint64_t diff = (ticksB - ticksA) / (freq / 1000);
+             // printf("Frame simulated in %ims\n", diff);
+             runFrameContext.state = 1;
++#ifndef OOT_WASM_GUEST
+             ProcessSaveStateRequests();
++#endif
+             return;
+         nextFrame:;
+         }
+@@ -506,6 +529,12 @@ static void RunFrame() {
+     exit(0);
+ }
+ 
++#ifdef OOT_WASM_GUEST
++void Graph_WasmRunFrame(void) {
++    RunFrame();
++}
++#endif
++
+ void Graph_ThreadEntry(void* arg0) {
+     while (WindowIsRunning()) {
+         RunFrame();
+diff --git a/soh/src/code/main.c b/soh/src/code/main.c
+index 98c6326..d2e50c1 100644
+--- a/soh/src/code/main.c
++++ b/soh/src/code/main.c
+@@ -10,6 +10,7 @@
+ #include <soh/Enhancements/bootcommands.h>
+ #include "soh/OTRGlobals.h"
+ #include "soh/CrashHandlerExt.h"
++#include <string.h>
+ 
+ s32 gScreenWidth = SCREEN_WIDTH;
+ s32 gScreenHeight = SCREEN_HEIGHT;
+@@ -43,6 +44,28 @@ void Main_LogSystemHeap(void) {
+     osSyncPrintf(VT_RST);
+ }
+ 
++#ifdef OOT_WASM_GUEST
++void Main_WasmInit(void) {
++    void* debugHeap;
++
++    Heaps_Alloc();
++    gScreenWidth = SCREEN_WIDTH;
++    gScreenHeight = SCREEN_HEIGHT;
++    gAppNmiBufferPtr = (PreNmiBuff*)osAppNmiBuffer;
++    PreNmiBuff_Init(gAppNmiBufferPtr);
++    Fault_Init();
++    SysCfb_Init(0);
++    gSystemHeapSize = SYSTEM_HEAP_SIZE;
++    SystemHeap_Init(gSystemHeap, gSystemHeapSize);
++    debugHeap = SYSTEM_ARENA_MALLOC_DEBUG(64 * 1024);
++    DebugArena_Init(debugHeap, 64 * 1024);
++    func_800636C0();
++    Audio_ResetSounds();
++    R_ENABLE_ARENA_DBG = 0;
++    memset(&gPadMgr, 0, sizeof(gPadMgr));
++}
++#endif
++
+ #ifdef _WIN32
+ int SDL_main(int argc, char* argv[]) {
+     AllocConsole();
+diff --git a/soh/src/code/z_actor.c b/soh/src/code/z_actor.c
+index 77c5abc..880d310 100644
+--- a/soh/src/code/z_actor.c
++++ b/soh/src/code/z_actor.c
+@@ -1,4 +1,9 @@
+ #include "global.h"
++
++#ifdef OOT_WASM_DIAGNOSTICS
++__attribute__((import_module("oot_diagnostics"), import_name("checkpoint")))
++void OotDiagnostics_Checkpoint(s32 stage, s32 value);
++#endif
+ #include "vt.h"
+ 
+ #include "overlays/actors/ovl_Arms_Hook/z_arms_hook.h"
+@@ -2577,6 +2582,14 @@ u32 D_80116068[ACTORCAT_MAX] = {
+     PLAYER_STATE1_TALKING | PLAYER_STATE1_DEAD | PLAYER_STATE1_IN_ITEM_CS,
+ };
+ 
++#ifdef OOT_WASM_GUEST
++static bool Actor_IsInGuestMemory(const Actor* actor) {
++    const uintptr_t address = (uintptr_t)actor;
++    const uintptr_t memorySize = __builtin_wasm_memory_size(0) * 65536u;
++    return address <= memorySize && sizeof(*actor) <= memorySize - address;
++}
++#endif
++
+ void Actor_UpdateAll(PlayState* play, ActorContext* actorCtx) {
+     Actor* refActor;
+     Actor* actor;
+@@ -2713,6 +2726,13 @@ void Actor_UpdateAll(PlayState* play, ActorContext* actorCtx) {
+ 
+     actor = player->focusActor;
+ 
++#ifdef OOT_WASM_GUEST
++    if ((actor != NULL) && !Actor_IsInGuestMemory(actor)) {
++        actor = NULL;
++        Player_ReleaseLockOn(player);
++    }
++#endif
++
+     if ((actor != NULL) && (actor->update == NULL)) {
+         actor = NULL;
+         Player_ReleaseLockOn(player);
+@@ -3332,6 +3352,9 @@ Actor* Actor_Spawn(ActorContext* actorCtx, PlayState* play, s16 actorId, f32 pos
+     u32 temp;
+ 
+     ActorDBEntry* dbEntry = ActorDB_Retrieve(actorId);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(1, actorId);
++#endif
+ 
+     assert(dbEntry->valid);
+ 
+@@ -3410,6 +3433,9 @@ Actor* Actor_Spawn(ActorContext* actorCtx, PlayState* play, s16 actorId, f32 pos
+ 
+     temp = gSegments[6];
+     Actor_Init(actor, play);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(2, actorId);
++#endif
+     gSegments[6] = temp;
+ 
+     GameInteractor_ExecuteOnActorSpawn(actor);
+diff --git a/soh/src/code/z_demo.c b/soh/src/code/z_demo.c
+index 0ca8f6a..dfa6ab1 100644
+--- a/soh/src/code/z_demo.c
++++ b/soh/src/code/z_demo.c
+@@ -37,6 +37,11 @@
+ #include "soh/Enhancements/game-interactor/GameInteractor_Hooks.h"
+ #include <libultraship/bridge/consolevariablebridge.h>
+ 
++#ifdef OOT_WASM_DIAGNOSTICS
++__attribute__((import_module("oot_diagnostics"), import_name("checkpoint")))
++void OotDiagnostics_Checkpoint(s32 stage, s32 value);
++#endif
++
+ u16 D_8011E1C0 = 0;
+ u16 D_8011E1C4 = 0;
+ 
+@@ -183,8 +188,17 @@ void func_800645A0(PlayState* play, CutsceneContext* csCtx) {
+     }
+ 
+     if (gSaveContext.cutsceneIndex >= 0xFFF0) {
++#ifdef OOT_WASM_DIAGNOSTICS
++        OotDiagnostics_Checkpoint(60, csCtx->state);
++#endif
+         func_80068ECC(play, csCtx);
++#ifdef OOT_WASM_DIAGNOSTICS
++        OotDiagnostics_Checkpoint(61, csCtx->state);
++#endif
+         sCsStateHandlers2[csCtx->state](play, csCtx);
++#ifdef OOT_WASM_DIAGNOSTICS
++        OotDiagnostics_Checkpoint(62, csCtx->state);
++#endif
+     }
+ }
+ 
+@@ -1707,6 +1721,10 @@ void Cutscene_ProcessCommands(PlayState* play, CutsceneContext* csCtx, u8* cutsc
+     s32 cutsceneEndFrame;
+     s16 j;
+ 
++ #ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(30, (s32)(uintptr_t)cutscenePtr);
++    OotDiagnostics_Checkpoint(31, ResourceMgr_OTRSigCheck(cutscenePtr));
++#endif
+     if (ResourceMgr_OTRSigCheck(cutscenePtr))
+         cutscenePtr = ResourceMgr_LoadCSByName(cutscenePtr);
+ 
+@@ -1714,6 +1732,10 @@ void Cutscene_ProcessCommands(PlayState* play, CutsceneContext* csCtx, u8* cutsc
+     cutscenePtr += sizeof(CutsceneData);
+     memcpy(&cutsceneEndFrame, cutscenePtr, sizeof(CutsceneData));
+     cutscenePtr += sizeof(CutsceneData);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(32, totalEntries);
++    OotDiagnostics_Checkpoint(33, cutsceneEndFrame);
++#endif
+ 
+     if ((cutsceneEndFrame < csCtx->frames) && (csCtx->state != CS_STATE_UNSKIPPABLE_EXEC)) {
+         csCtx->state = CS_STATE_UNSKIPPABLE_INIT;
+@@ -1727,8 +1749,14 @@ void Cutscene_ProcessCommands(PlayState* play, CutsceneContext* csCtx, u8* cutsc
+     }
+ 
+     for (i = 0; i < totalEntries; i++) {
++#ifdef OOT_WASM_DIAGNOSTICS
++        OotDiagnostics_Checkpoint(34, i);
++#endif
+         memcpy(&cmdType, cutscenePtr, sizeof(CutsceneData));
+         cutscenePtr += sizeof(CutsceneData);
++#ifdef OOT_WASM_DIAGNOSTICS
++        OotDiagnostics_Checkpoint(35, cmdType);
++#endif
+ 
+         if (cmdType == -1) {
+             return;
+@@ -2076,6 +2104,9 @@ void func_80068C3C(PlayState* play, CutsceneContext* csCtx) {
+         } else {
+             Cutscene_ProcessCommands(play, csCtx, play->csCtx.segment);
+         }
++#ifdef OOT_WASM_DIAGNOSTICS
++        OotDiagnostics_Checkpoint(36, csCtx->frames);
++#endif
+     }
+ }
+ 
+diff --git a/soh/src/code/z_kanfont.c b/soh/src/code/z_kanfont.c
+index 7c85204..519a604 100644
+--- a/soh/src/code/z_kanfont.c
++++ b/soh/src/code/z_kanfont.c
+@@ -4257,7 +4257,9 @@ void Font_LoadOrderedFontNTSC(Font* font) {
+         if (font->msgBufWide[codePointIndex] != 0xA) {
+             offset = Kanji_OffsetFromShiftJIS(font->msgBufWide[codePointIndex]);
+             offset /= FONT_CHAR_TEX_SIZE;
+-            memcpy(&font->fontBuf[fontBufIndex * 8], kanjiFontTbl[offset], strlen(kanjiFontTbl[offset]) + 1);
++            if (offset >= 0 && offset < ARRAY_COUNT(kanjiFontTbl)) {
++                memcpy(&font->fontBuf[fontBufIndex * 8], kanjiFontTbl[offset], strlen(kanjiFontTbl[offset]) + 1);
++            }
+             // DmaMgr_RequestSync(&font->fontBuf[fontBufIndex * 8], (uintptr_t)_kanjiSegmentStart + offset,
+             // FONT_CHAR_TEX_SIZE);
+             fontBufIndex += FONT_CHAR_TEX_SIZE / 8;
+diff --git a/soh/src/code/z_play.c b/soh/src/code/z_play.c
+index 37fc299..6f89379 100644
+--- a/soh/src/code/z_play.c
++++ b/soh/src/code/z_play.c
+@@ -2,6 +2,7 @@
+ #include "vt.h"
+ 
+ #include <string.h>
++#include <stdlib.h>
+ 
+ #include "soh/Enhancements/gameconsole.h"
+ #include "soh/frame_interpolation.h"
+@@ -17,6 +18,11 @@
+ #include <time.h>
+ #include <assert.h>
+ 
++#ifdef OOT_WASM_DIAGNOSTICS
++__attribute__((import_module("oot_diagnostics"), import_name("checkpoint")))
++void OotDiagnostics_Checkpoint(s32 stage, s32 value);
++#endif
++
+ TransitionUnk sTrnsnUnk;
+ s32 gTrnsnUnkState;
+ VisMono gPlayVisMono;
+@@ -476,6 +482,9 @@ void Play_Init(GameState* thisx) {
+     Play_SpawnScene(play,
+                     gEntranceTable[((void)0, gSaveContext.entranceIndex) + ((void)0, gSaveContext.sceneLayer)].scene,
+                     gEntranceTable[((void)0, gSaveContext.sceneLayer) + ((void)0, gSaveContext.entranceIndex)].spawn);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(48, gSaveContext.sceneLayer);
++#endif
+ 
+     osSyncPrintf("\nSCENE_NO=%d COUNTER=%d\n", ((void)0, gSaveContext.entranceIndex), gSaveContext.sceneLayer);
+ 
+@@ -493,6 +502,9 @@ void Play_Init(GameState* thisx) {
+     Cutscene_HandleEntranceTriggers(play);
+     KaleidoScopeCall_Init(play);
+     func_801109B0(play);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(49, 0);
++#endif
+ 
+     if (gSaveContext.nextDayTime != 0xFFFF) {
+         if (gSaveContext.nextDayTime == 0x8001) {
+@@ -518,7 +530,13 @@ void Play_Init(GameState* thisx) {
+     gTrnsnUnkState = 0;
+     play->transitionMode = TRANS_MODE_OFF;
+     FrameAdvance_Init(&play->frameAdvCtx);
+-    Rand_Seed((u32)osGetTime());
++#ifdef OOT_WASM_GUEST
++    extern u32 OotShipwright_GetRandomSeed(void);
++    Rand_Seed(OotShipwright_GetRandomSeed());
++#else
++    const char* referenceRandomSeed = getenv("OOT_FAST3D_RANDOM_SEED");
++    Rand_Seed(referenceRandomSeed == NULL ? (u32)osGetTime() : (u32)strtoul(referenceRandomSeed, NULL, 0));
++#endif
+     Matrix_Init(&play->state);
+     play->state.main = Play_Main;
+     play->state.destroy = Play_Destroy;
+@@ -563,15 +581,30 @@ void Play_Init(GameState* thisx) {
+     gItemAgeReqs[ITEM_ROCS_FEATHER] = AGE_REQ_NONE;
+     gSlotAgeReqs[SLOT_NAYRUS_LOVE] = AGE_REQ_NONE;
+ 
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(50, 0);
++#endif
+     Actor_InitContext(play, &play->actorCtx, play->linkActorEntry);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(51, 0);
++#endif
+ 
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(52, play->roomCtx.status);
++#endif
+     while (!func_800973FC(play, &play->roomCtx)) {
+         ; // Empty Loop
+     }
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(53, play->roomCtx.status);
++#endif
+ 
+     player = GET_PLAYER(play);
+     Camera_InitPlayerSettings(&play->mainCamera, player);
+     Camera_RequestMode(&play->mainCamera, CAM_MODE_NORMAL);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(54, 0);
++#endif
+ 
+     // OTRTODO: Bounds check cameraDataList to guard against scenes spawning the player with
+     // an out of bounds background camera index. This requires adding an extra field to the
+@@ -606,6 +639,9 @@ void Play_Init(GameState* thisx) {
+     gSaveContext.natureAmbienceId = play->sequenceCtx.natureAmbienceId;
+     Actor_InitPlayerHorse(play, GET_PLAYER(play));
+     AnimationContext_Update(play, &play->animationCtx);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(55, 0);
++#endif
+     gSaveContext.respawnFlag = 0;
+ 
+     // #region SOH [Stats]
+@@ -652,6 +688,9 @@ void Play_Init(GameState* thisx) {
+ 
+     // nextEntranceIndex was not initialized, so the previous value was carried over during soft resets.
+     gPlayState->nextEntranceIndex = gSaveContext.entranceIndex;
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(56, 0);
++#endif
+ }
+ 
+ void Play_Update(PlayState* play) {
+@@ -1177,12 +1216,18 @@ void Play_Update(PlayState* play) {
+ 
+                     PLAY_LOG(3648);
+                     func_800645A0(play, &play->csCtx);
++#ifdef OOT_WASM_DIAGNOSTICS
++                    OotDiagnostics_Checkpoint(70, play->csCtx.frames);
++#endif
+ 
+                     PLAY_LOG(3651);
+                     Effect_UpdateAll(play);
+ 
+                     PLAY_LOG(3657);
+                     EffectSs_UpdateAll(play);
++#ifdef OOT_WASM_DIAGNOSTICS
++                    OotDiagnostics_Checkpoint(71, play->csCtx.frames);
++#endif
+ 
+                     PLAY_LOG(3662);
+                 }
+@@ -1195,6 +1240,9 @@ void Play_Update(PlayState* play) {
+ 
+             PLAY_LOG(3675);
+             func_80095AA0(play, &play->roomCtx.prevRoom, &input[1], 1);
++#ifdef OOT_WASM_DIAGNOSTICS
++            OotDiagnostics_Checkpoint(72, play->csCtx.frames);
++#endif
+ 
+             PLAY_LOG(3677);
+ 
+@@ -1251,6 +1299,9 @@ void Play_Update(PlayState* play) {
+ 
+             PLAY_LOG(3783);
+             TransitionFade_Update(&play->transitionFade, R_UPDATE_RATE);
++#ifdef OOT_WASM_DIAGNOSTICS
++            OotDiagnostics_Checkpoint(73, play->csCtx.frames);
++#endif
+         } else {
+             goto skip;
+         }
+@@ -1278,6 +1329,9 @@ skip:
+         }
+ 
+         Camera_Update(play->cameraPtrs[play->nextCamera]);
++#ifdef OOT_WASM_DIAGNOSTICS
++        OotDiagnostics_Checkpoint(74, play->csCtx.frames);
++#endif
+ 
+         PLAY_LOG(3814);
+     }
+@@ -1285,6 +1339,9 @@ skip:
+     PLAY_LOG(3816);
+     Environment_Update(play, &play->envCtx, &play->lightCtx, &play->pauseCtx, &play->msgCtx, &play->gameOverCtx,
+                        play->state.gfxCtx);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(75, play->csCtx.frames);
++#endif
+ }
+ 
+ void Play_DrawOverlayElements(PlayState* play) {
+@@ -1498,9 +1555,15 @@ void Play_Draw(PlayState* play) {
+                 } else {
+                     roomDrawFlags = HREG(84);
+                 }
++#ifdef OOT_WASM_DIAGNOSTICS
++                OotDiagnostics_Checkpoint(82, play->csCtx.frames);
++#endif
+                 Scene_Draw(play);
+                 Room_Draw(play, &play->roomCtx.curRoom, roomDrawFlags & 3);
+                 Room_Draw(play, &play->roomCtx.prevRoom, roomDrawFlags & 3);
++#ifdef OOT_WASM_DIAGNOSTICS
++                OotDiagnostics_Checkpoint(83, play->csCtx.frames);
++#endif
+             }
+         }
+ 
+@@ -1523,7 +1586,13 @@ void Play_Draw(PlayState* play) {
+         }
+ 
+         if ((HREG(80) != 10) || (HREG(85) != 0)) {
++#ifdef OOT_WASM_DIAGNOSTICS
++            OotDiagnostics_Checkpoint(84, play->csCtx.frames);
++#endif
+             Actor_DrawAll(play, &play->actorCtx);
++#ifdef OOT_WASM_DIAGNOSTICS
++            OotDiagnostics_Checkpoint(85, play->csCtx.frames);
++#endif
+         }
+ 
+         if ((HREG(80) != 10) || (HREG(86) != 0)) {
+@@ -1635,6 +1704,9 @@ Play_Draw_skip:
+     CLOSE_DISPS(gfxCtx);
+ 
+     Interface_DrawTotalGameplayTimer(play);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(86, play->csCtx.frames);
++#endif
+ }
+ 
+ time_t Play_GetRealTime() {
+@@ -1687,7 +1759,13 @@ void Play_Main(GameState* thisx) {
+     PLAY_LOG(4583);
+ 
+     FrameInterpolation_StartRecord();
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(80, play->csCtx.frames);
++#endif
+     Play_Draw(play);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(81, play->csCtx.frames);
++#endif
+     FrameInterpolation_StopRecord();
+ 
+     PLAY_LOG(4587);
+diff --git a/soh/src/overlays/actors/ovl_player_actor/z_player.c b/soh/src/overlays/actors/ovl_player_actor/z_player.c
+index 6dc2e12..282ab55 100644
+--- a/soh/src/overlays/actors/ovl_player_actor/z_player.c
++++ b/soh/src/overlays/actors/ovl_player_actor/z_player.c
+@@ -34,6 +34,11 @@
+ #include "soh/Enhancements/savestate_serialize.h"
+ 
+ #include <string.h>
++
++#ifdef OOT_WASM_DIAGNOSTICS
++__attribute__((import_module("oot_diagnostics"), import_name("checkpoint")))
++void OotDiagnostics_Checkpoint(s32 stage, s32 value);
++#endif
+ #include <stdlib.h>
+ #include <assert.h>
+ #include <libultraship/bridge/consolevariablebridge.h>
+@@ -10740,12 +10745,21 @@ void Player_InitCommon(Player* this, PlayState* play, FlexSkeletonHeader* skelHe
+     this->meleeWeaponEffectIndex = TOTAL_EFFECT_COUNT;
+     this->yaw = this->actor.world.rot.y;
+     func_80834644(play, this);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(20, 0);
++#endif
+ 
+     SkelAnime_InitLink(play, &this->skelAnime, skelHeader, GET_PLAYER_ANIM(PLAYER_ANIMGROUP_wait, this->modelAnimType),
+                        9, this->jointTable, this->morphTable, PLAYER_LIMB_MAX);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(21, 0);
++#endif
+     this->skelAnime.baseTransl = sSkeletonBaseTransl;
+     SkelAnime_InitLink(play, &this->upperSkelAnime, skelHeader, Player_GetIdleAnim(this), 9, this->upperJointTable,
+                        this->upperMorphTable, PLAYER_LIMB_MAX);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(22, 0);
++#endif
+     this->upperSkelAnime.baseTransl = sSkeletonBaseTransl;
+ 
+     Effect_Add(play, &this->meleeWeaponEffectIndex, EFFECT_BLURE2, 0, 0, &blureSword);
+@@ -10759,6 +10773,9 @@ void Player_InitCommon(Player* this, PlayState* play, FlexSkeletonHeader* skelHe
+     Collider_SetQuad(play, &this->meleeWeaponQuads[1], &this->actor, &D_80854650);
+     Collider_InitQuad(play, &this->shieldQuad);
+     Collider_SetQuad(play, &this->shieldQuad, &this->actor, &D_808546A0);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(23, 0);
++#endif
+ 
+     this->ivanDamageMultiplier = 1;
+ }
+@@ -10792,6 +10809,9 @@ void Player_Init(Actor* thisx, PlayState* play2) {
+     s32 startMode;
+     s32 respawnFlag;
+     s32 respawnMode;
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(10, 0);
++#endif
+ 
+     play->shootingGalleryStatus = play->bombchuBowlingStatus = 0;
+ 
+@@ -10811,9 +10831,18 @@ void Player_Init(Actor* thisx, PlayState* play2) {
+     this->heldItemId = ITEM_NONE;
+ 
+     Player_UseItem(play, this, ITEM_NONE);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(11, 0);
++#endif
+     Player_SetEquipmentData(play, this);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(12, 0);
++#endif
+     this->prevBoots = this->currentBoots;
+     Player_InitCommon(this, play, gPlayerSkelHeaders[((void)0, gSaveContext.linkAge)]);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(13, 0);
++#endif
+     // `giObjectSegment` is used for both "get item" objects and title cards. The maximum size for
+     // get item objects is 0x2000 (see the assert in func_8083AE40), and the maximum size for
+     // title cards is 0x1000 * LANGUAGE_MAX since each title card image includes all languages.
+@@ -10865,6 +10894,9 @@ void Player_Init(Actor* thisx, PlayState* play2) {
+     if (func_80845C68(play, (respawnFlag == 2) ? 1 : 0) == 0) {
+         gSaveContext.respawn[RESPAWN_MODE_DOWN].playerParams = (thisx->params & 0xFF) | 0xD00;
+     }
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(14, 0);
++#endif
+ 
+     gSaveContext.respawn[RESPAWN_MODE_DOWN].data = 1;
+ 
+@@ -10905,6 +10937,9 @@ void Player_Init(Actor* thisx, PlayState* play2) {
+     }
+ 
+     Map_SavePlayerInitialInfo(play);
++#ifdef OOT_WASM_DIAGNOSTICS
++    OotDiagnostics_Checkpoint(15, 0);
++#endif
+     MREG(64) = 0;
+ }
+ 

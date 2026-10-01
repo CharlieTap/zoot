@@ -1,0 +1,61 @@
+Subject: Preserve guest memory limits and fixed audio settings.
+
+Upstream-Status: Zoot-specific Wasm configuration.
+
+diff --git a/libultraship/src/fast/interpreter.cpp b/libultraship/src/fast/interpreter.cpp
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -14,6 +14,7 @@
+ #include <any>
++#include <array>
+ #include <map>
+ #include <set>
+ #include <unordered_map>
+ #include <vector>
+ #include <list>
+
+diff --git a/soh/include/z64.h b/soh/include/z64.h
+index e47f838..30ae617 100644
+--- a/soh/include/z64.h
++++ b/soh/include/z64.h
+@@ -96,11 +96,20 @@ typedef struct {
+ // Changed the main buffers to be 1MiB to make them basically impossible to overflow
+ typedef struct {
+     /* 0x00000 */ u16 headMagic; // GFXPOOL_HEAD_MAGIC
++#ifdef OOT_WASM_GUEST
++    // Keep the guest's existing pools within its 16 MiB initial memory.
++    Gfx polyOpaBuffer[0x2FC0];
++    Gfx polyXluBuffer[0x1000];
++    Gfx overlayBuffer[0x800];
++    Gfx workBuffer[0x100];
++    Gfx unusedBuffer[0x40];
++#else
+     /* 0x00008 */ Gfx polyOpaBuffer[1 * 1024 * 1024]; // original size was 0x17E0
+     /* 0x0BF08 */ Gfx polyXluBuffer[1 * 1024 * 1024]; // original size was 0x800
+     /* 0x0FF08 */ Gfx overlayBuffer[1 * 1024 * 1024]; // original size was 0x400
+     /* 0x11F08 */ Gfx workBuffer[0x80];
+     /* 0x11308 */ Gfx unusedBuffer[0x20];
++#endif
+     /* 0x12408 */ u16 tailMagic; // GFXPOOL_TAIL_MAGIC
+ } GfxPool; // size = 0x12410
+ 
+diff --git a/soh/soh/Enhancements/audio/AudioSettings.h b/soh/soh/Enhancements/audio/AudioSettings.h
+index 7e2d99e..e507d2b 100644
+--- a/soh/soh/Enhancements/audio/AudioSettings.h
++++ b/soh/soh/Enhancements/audio/AudioSettings.h
+@@ -8,9 +8,15 @@ extern "C" {
+ 
+ // cvars used by the audio thread should go here
+ // direct use can result in a race condition with the main thread
++#ifdef OOT_FIXED_CVARS
++static inline float AudioSettings_GetMasterVolume(void) { return 40.0f / 100.0f; }
++static inline int32_t AudioSettings_GetOctaveDrop(void) { return 0; }
++static inline int32_t AudioSettings_GetMirroredWorld(void) { return 0; }
++#else
+ float AudioSettings_GetMasterVolume(void);
+ int32_t AudioSettings_GetOctaveDrop(void);
+ int32_t AudioSettings_GetMirroredWorld(void);
++#endif
+ 
+ #ifdef __cplusplus
+ }

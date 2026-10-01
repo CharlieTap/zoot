@@ -1,0 +1,8 @@
+0001-game-wasm-integration.patch
+0002-audio-mixer-optimisations.patch
+0003-fast3d-wasm-and-reference-renderer.patch
+0004-source-archive-build.patch
+0005-guest-upstream-compatibility.patch
+0006-torch-optional-audio-importer.patch
+0007-magic-meter-texture-bounds.patch
+0008-validate-cached-resource-path.patch

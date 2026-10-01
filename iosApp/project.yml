@@ -1,0 +1,82 @@
+name: Oot
+options:
+  bundleIdPrefix: com.tap.zoot
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    TARGETED_DEVICE_FAMILY: "1,2"
+    EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+    CODE_SIGN_STYLE: Automatic
+targets:
+  Oot:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Resources
+      - path: ../ios/build/game-assets/oot.wasm
+        buildPhase: resources
+      - path: ../ios/build/game-assets/oot.o2r
+        buildPhase: resources
+      - path: ../ios/build/game-assets/soh.o2r
+        buildPhase: resources
+      - path: ../ios/build/game-assets/language.txt
+        buildPhase: resources
+      - path: ../ios/build/game-assets/THIRD_PARTY_NOTICES.txt
+        buildPhase: resources
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Zoot
+        CADisableMinimumFrameDurationOnPhone: true
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        UIRequiresFullScreen: true
+        UIStatusBarHidden: true
+        UIViewControllerBasedStatusBarAppearance: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tap.zoot
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        FRAMEWORK_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../ios/build/xcode-frameworks/$(CONFIGURATION)/$(SDK_NAME)"
+        OTHER_LDFLAGS: "$(inherited) -framework OotApp"
+    preBuildScripts:
+      - name: Build Kotlin app
+        basedOnDependencyAnalysis: false
+        script: |
+          if [ "${OVERRIDE_KOTLIN_BUILD_IDE_SUPPORTED:-NO}" = "YES" ]; then
+            mkdir -p "$BUILT_PRODUCTS_DIR"
+            ln -sfn "$ZOOT_KOTLIN_FRAMEWORK" "$BUILT_PRODUCTS_DIR/OotApp.framework"
+            exit 0
+          fi
+          cd "$SRCROOT/.."
+          export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home}"
+          ./gradlew :ios:stageGameAssets :ios:embedAndSignAppleFrameworkForXcode --no-configuration-cache
+  OotUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: Oot
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        PRODUCT_BUNDLE_IDENTIFIER: com.tap.zoot.uitests
+        TEST_TARGET_NAME: Oot
+schemes:
+  Oot:
+    build:
+      targets:
+        Oot: all
+    run:
+      config: Release
+    test:
+      config: Release
+      targets:
+        - OotUITests

@@ -1,0 +1,32 @@
+Subject: Fetch audio import dependencies only when their factory is enabled.
+
+Upstream-Status: Candidate for upstream; dr_libs is used by the BK64 importer.
+
+diff --git a/torch/CMakeLists.txt b/torch/CMakeLists.txt
+--- a/torch/CMakeLists.txt
++++ b/torch/CMakeLists.txt
+@@ -81,14 +81,16 @@ if(USE_STANDALONE)
+ endif()
+ 
+ # Audio decoding for the soundfont importer; header-only
+-FetchContent_Declare(
+-    dr_libs
+-    GIT_REPOSITORY https://github.com/mackron/dr_libs.git
+-    GIT_TAG da35f9d6c7374a95353fd1df1d394d44ab66cf01
+-    GIT_SUBMODULES ""
+-)
+-FetchContent_MakeAvailable(dr_libs)
+-include_directories(${dr_libs_SOURCE_DIR})
++if(BUILD_BK64)
++    FetchContent_Declare(
++        dr_libs
++        GIT_REPOSITORY https://github.com/mackron/dr_libs.git
++        GIT_TAG da35f9d6c7374a95353fd1df1d394d44ab66cf01
++        GIT_SUBMODULES ""
++    )
++    FetchContent_MakeAvailable(dr_libs)
++    include_directories(${dr_libs_SOURCE_DIR})
++endif()
+ 
+ # Interactive viewer renderer: libultraship + Fast3D (true N64 rendering). LUS
+ # bundles its own ImGui, so it fully replaces the old raylib/rlImGui backend.

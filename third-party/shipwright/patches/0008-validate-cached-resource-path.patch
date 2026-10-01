@@ -1,0 +1,23 @@
+Subject: Validate cached paths when the game reuses a texture-name buffer.
+
+Upstream-Status: Fix for pointer-cache use with Shipwright's mutable font buffers.
+
+Font, message and inventory code copies different OTR paths into the same
+buffer. Compare against the resource's existing owned path before accepting
+a hit. This still skips CRC64 and the resource lookup, without another key copy.
+
+diff --git a/libultraship/src/fast/interpreter.cpp b/libultraship/src/fast/interpreter.cpp
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -469,6 +469,10 @@ std::shared_ptr<Ship::IResource> Interpreter::ResolveResourceCached(const char* path) {
+     auto it = mResolvedResourceCache.find(path);
+     if (it != mResolvedResourceCache.end()) {
+-        return it->second;
++        // Shipwright reuses some buffers for different font and UI paths.
++        const char* resourcePath = strncmp(path, "__OTR__", 7) == 0 ? path + 7 : path;
++        if (strcmp(resourcePath, it->second->GetInitData()->Path.c_str()) == 0) {
++            return it->second;
++        }
+     }
+     auto res = Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess(path);
+     // Only memoize a hit. The resource manager caches its own misses, so re-asking

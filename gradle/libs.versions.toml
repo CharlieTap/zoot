@@ -1,0 +1,76 @@
+[versions]
+version-name = "0.1.0"
+application-id = "com.tap.zoot"
+application-namespace = "com.tap.zoot"
+compile-sdk = "37"
+target-sdk = "35"
+min-sdk = "28"
+java = "17"
+# Shipwright release of the pinned ZOOT_SHIPWRIGHT_REVISION; recorded in generated archives.
+shipwright = "9.2.3"
+android-gradle-plugin = "9.3.1"
+kotlin = "2.4.20"
+compose-multiplatform = "1.12.1"
+compose-material3 = "1.9.0"
+compose-bom = "2026.09.00"
+activity = "1.13.0"
+lifecycle = "2.11.0"
+webgpu = "1.0.0-alpha05"
+coroutines = "1.11.0"
+atomicfu = "0.29.0"
+metro = "1.4.2"
+kotlinter = "5.6.0"
+chasm = "2.1.0"
+chasm-plugin = "3.1.0-2.1.0"
+junit = "4.13.2"
+robolectric = "4.16.1"
+androidx-test = "1.7.0"
+androidx-compose-test = "1.11.2"
+
+[plugins]
+chasm = { id = "io.github.charlietap.chasm.gradle", version.ref = "chasm-plugin" }
+zoot-assets = { id = "zoot" }
+zoot-android = { id = "zoot.android" }
+zoot-ios = { id = "zoot.ios" }
+zoot-guest = { id = "zoot.guest" }
+android-application = { id = "com.android.application", version.ref = "android-gradle-plugin" }
+android-kmp-library = { id = "com.android.kotlin.multiplatform.library", version.ref = "android-gradle-plugin" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+compose-multiplatform = { id = "org.jetbrains.compose", version.ref = "compose-multiplatform" }
+metro = { id = "dev.zacsweers.metro", version.ref = "metro" }
+kotlinter = { id = "org.jmailen.kotlinter", version.ref = "kotlinter" }
+conventions-kotlin = { id = "zoot-kotlin-conventions" }
+conventions-compose = { id = "zoot-compose-conventions" }
+conventions-linting = { id = "zoot-linting-conventions" }
+
+[libraries]
+android-gradle-plugin = { module = "com.android.tools.build:gradle", version.ref = "android-gradle-plugin" }
+kotlin-gradle-plugin = { module = "org.jetbrains.kotlin:kotlin-gradle-plugin", version.ref = "kotlin" }
+kotlin-test-junit = { module = "org.jetbrains.kotlin:kotlin-test-junit", version.ref = "kotlin" }
+compose-gradle-plugin = { module = "org.jetbrains.compose:compose-gradle-plugin", version.ref = "compose-multiplatform" }
+androidx-compose-bom = { module = "androidx.compose:compose-bom", version.ref = "compose-bom" }
+compose-foundation = { module = "org.jetbrains.compose.foundation:foundation", version.ref = "compose-multiplatform" }
+compose-resources = { module = "org.jetbrains.compose.components:components-resources", version.ref = "compose-multiplatform" }
+compose-runtime = { module = "org.jetbrains.compose.runtime:runtime", version.ref = "compose-multiplatform" }
+compose-ui = { module = "org.jetbrains.compose.ui:ui", version.ref = "compose-multiplatform" }
+compose-ui-test = { module = "org.jetbrains.compose.ui:ui-test", version.ref = "compose-multiplatform" }
+compose-material3 = { module = "org.jetbrains.compose.material3:material3", version.ref = "compose-material3" }
+activity = { module = "androidx.activity:activity", version.ref = "activity" }
+activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activity" }
+lifecycle-runtime-compose = { module = "org.jetbrains.androidx.lifecycle:lifecycle-runtime-compose", version.ref = "lifecycle" }
+webgpu = { module = "androidx.webgpu:webgpu", version.ref = "webgpu" }
+coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
+atomicfu = { module = "org.jetbrains.kotlinx:atomicfu", version.ref = "atomicfu" }
+metrox-android = { module = "dev.zacsweers.metro:metrox-android", version.ref = "metro" }
+metrox-viewmodel = { module = "dev.zacsweers.metro:metrox-viewmodel", version.ref = "metro" }
+chasm = { module = "io.github.charlietap.chasm:chasm", version.ref = "chasm" }
+chasm-host = { module = "io.github.charlietap.chasm:host", version.ref = "chasm" }
+chasm-memory = { module = "io.github.charlietap.chasm:memory", version.ref = "chasm" }
+junit = { module = "junit:junit", version.ref = "junit" }
+robolectric = { module = "org.robolectric:robolectric", version.ref = "robolectric" }
+androidx-test-runner = { module = "androidx.test:runner", version.ref = "androidx-test" }
+androidx-compose-ui-test-junit4 = { module = "androidx.compose.ui:ui-test-junit4-android", version.ref = "androidx-compose-test" }

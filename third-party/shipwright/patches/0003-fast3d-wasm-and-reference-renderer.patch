@@ -1,0 +1,2767 @@
+Subject: Preserve Fast3D correctness, scalar optimisations and reference-renderer instrumentation.
+
+Upstream-Status: Zoot-specific; captured from the existing working source.
+
+diff --git a/libultraship/include/fast/backends/gfx_opengl.h b/libultraship/include/fast/backends/gfx_opengl.h
+index af24c70..43e908c 100644
+--- a/libultraship/include/fast/backends/gfx_opengl.h
++++ b/libultraship/include/fast/backends/gfx_opengl.h
+@@ -94,6 +94,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
+     void ClearFramebuffer(bool color, bool depth) override;
+     void ClearDepthRegion(int x, int y, int w, int h) override;
+     void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) override;
++    bool ReadFramebufferDepthToCPU(int fbId, uint32_t width, uint32_t height, float* depthBuf) override;
+     void ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) override;
+     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
+     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) override;
+diff --git a/libultraship/include/fast/backends/gfx_rendering_api.h b/libultraship/include/fast/backends/gfx_rendering_api.h
+index 3eb0996..796a4dd 100644
+--- a/libultraship/include/fast/backends/gfx_rendering_api.h
++++ b/libultraship/include/fast/backends/gfx_rendering_api.h
+@@ -68,6 +68,9 @@ class GfxRenderingAPI {
+         ClearFramebuffer(false, true);
+     }
+     virtual void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) = 0;
++    virtual bool ReadFramebufferDepthToCPU(int, uint32_t, uint32_t, float*) {
++        return false;
++    }
+     virtual void ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) = 0;
+     virtual std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
+     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) = 0;
+diff --git a/libultraship/include/fast/interpreter.h b/libultraship/include/fast/interpreter.h
+index 4c6a705..66d0621 100644
+--- a/libultraship/include/fast/interpreter.h
++++ b/libultraship/include/fast/interpreter.h
+@@ -357,6 +357,19 @@ struct RenderingState {
+     TextureCacheNode* mTextures[SHADER_MAX_TEXTURES];
+ };
+ 
++// Derived draw state shared by consecutive triangle commands. Any other command invalidates it.
++struct TriangleState {
++    bool valid = false;
++    ColorCombiner* comb;
++    uint32_t tm;
++    uint32_t tex_width[2], tex_height[2], tex_width2[2], tex_height2[2], effective_tile[2];
++    uint8_t numInputs;
++    bool usedTextures[2];
++    bool use_alpha, use_fog, use_blend_color, use_grayscale;
++    bool triangle_lod;
++    GfxClipParameters clip_parameters;
++};
++
+ struct FBInfo {
+     uint32_t orig_width, orig_height;       // Original shape
+     uint32_t applied_width, applied_height; // Up-scaled for the viewport
+@@ -456,7 +469,7 @@ class Interpreter {
+     void GfxSpTexture(uint16_t sc, uint16_t tc, uint8_t level, uint8_t tile, uint8_t on);
+     void GfxDpSetScissor(uint32_t mode, uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry);
+     void GfxDpSetTextureImage(uint32_t format, uint32_t size, uint32_t width, const char* texPath, uint32_t texFlags,
+-                              RawTexMetadata rawTexMetdata, const void* addr);
++                              const RawTexMetadata& rawTexMetdata, const void* addr);
+     void GfxDpSetTile(uint8_t fmt, uint32_t siz, uint32_t line, uint32_t tmem, uint8_t tile, uint32_t palette,
+                       uint32_t cmt, uint32_t maskt, uint32_t shiftt, uint32_t cms, uint32_t masks, uint32_t shifts);
+     void GfxDpSetTileSize(uint8_t tile, uint16_t uls, uint16_t ult, uint16_t lrs, uint16_t lrt);
+@@ -505,6 +518,14 @@ class Interpreter {
+     RSP* mRsp;
+     RDP* mRdp;
+     RenderingState mRenderingState{};
++    TriangleState mTriangleState{};
++    // Expanded vertices are reusable until the next non-triangle command.
++    float mPackedVertices[MAX_VERTICES][48];
++    uint8_t mPackedVertexLengths[MAX_VERTICES]{};
++    struct NormalColor {
++        uint32_t normal;
++        RGBA color;
++    } mNormalColors[64];
+ 
+     GfxTextureCache mTextureCache{};
+     std::unordered_map<const void*, std::shared_ptr<Ship::IResource>> mResolvedResourceCache;
+@@ -573,4 +594,4 @@ const char* GfxGetOpcodeName(int8_t opcode);
+ extern "C" void gfx_texture_cache_clear();
+ extern "C" void gfx_shader_cache_clear();
+ extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,
+-                                      uint8_t resize, bool forceFixedAspect = false);
+\ No newline at end of file
++                                      uint8_t resize, bool forceFixedAspect = false);
+diff --git a/libultraship/include/fast/reference_trace.h b/libultraship/include/fast/reference_trace.h
+new file mode 100644
+index 0000000..1c77561
+--- /dev/null
++++ b/libultraship/include/fast/reference_trace.h
+@@ -0,0 +1,28 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++union F3DGfx;
++
++namespace Fast {
++
++class Interpreter;
++class GfxRenderingAPI;
++struct LoadedVertex;
++
++void ReferenceTraceBeginRun(Interpreter* interpreter);
++void ReferenceTraceEndRun(Interpreter* interpreter);
++void ReferenceTraceCommand(Interpreter* interpreter, const F3DGfx* command, uint32_t microcode, size_t stackDepth);
++void ReferenceTraceResource(Interpreter* interpreter, uint8_t opcode, const char* path);
++void ReferenceTraceState(Interpreter* interpreter);
++void ReferenceTraceVertex(Interpreter* interpreter, size_t index, const LoadedVertex& vertex);
++void ReferenceTraceTriangle(Interpreter* interpreter, uint8_t first, uint8_t second, uint8_t third,
++                            const char* disposition);
++void ReferenceTraceGeometry(Interpreter* interpreter, const float* vertices, size_t floatCount);
++void ReferenceTraceFramebuffers(GfxRenderingAPI* renderingApi, int frameBuffer, uint32_t width, uint32_t height);
++void ReferenceTraceDraw(Interpreter* interpreter, const float* vertices, size_t floatCount, size_t triangleCount);
++void ReferenceTraceOperation(Interpreter* interpreter, const char* operation, int first = 0, int second = 0,
++                             int third = 0, int fourth = 0);
++
++} // namespace Fast
+diff --git a/libultraship/include/libultraship/bridge/consolevariablebridge.h b/libultraship/include/libultraship/bridge/consolevariablebridge.h
+index 6c930b6..9e21fc1 100644
+--- a/libultraship/include/libultraship/bridge/consolevariablebridge.h
++++ b/libultraship/include/libultraship/bridge/consolevariablebridge.h
+@@ -22,35 +22,55 @@ extern "C" {
+  * @param name         CVar name.
+  * @param defaultValue Value returned when the CVar does not exist.
+  */
++#ifdef OOT_FIXED_CVARS
++static inline int32_t CVarGetInteger(const char* name, int32_t defaultValue) { return defaultValue; }
++#else
+ API_EXPORT int32_t CVarGetInteger(const char* name, int32_t defaultValue);
++#endif
+ 
+ /**
+  * @brief Returns the float value of the named CVar, or @p defaultValue if it is not set.
+  * @param name         CVar name.
+  * @param defaultValue Value returned when the CVar does not exist.
+  */
++#ifdef OOT_FIXED_CVARS
++static inline float CVarGetFloat(const char* name, float defaultValue) { return defaultValue; }
++#else
+ API_EXPORT float CVarGetFloat(const char* name, float defaultValue);
++#endif
+ 
+ /**
+  * @brief Returns the string value of the named CVar, or @p defaultValue if it is not set.
+  * @param name         CVar name.
+  * @param defaultValue Value returned when the CVar does not exist (must outlive the call).
+  */
++#ifdef OOT_FIXED_CVARS
++static inline const char* CVarGetString(const char* name, const char* defaultValue) { return defaultValue; }
++#else
+ API_EXPORT const char* CVarGetString(const char* name, const char* defaultValue);
++#endif
+ 
+ /**
+  * @brief Returns the RGBA colour value of the named CVar, or @p defaultValue if it is not set.
+  * @param name         CVar name.
+  * @param defaultValue Default RGBA colour.
+  */
++#ifdef OOT_FIXED_CVARS
++static inline Color_RGBA8 CVarGetColor(const char* name, Color_RGBA8 defaultValue) { return defaultValue; }
++#else
+ API_EXPORT Color_RGBA8 CVarGetColor(const char* name, Color_RGBA8 defaultValue);
++#endif
+ 
+ /**
+  * @brief Returns the RGB colour value of the named CVar, or @p defaultValue if it is not set.
+  * @param name         CVar name.
+  * @param defaultValue Default RGB colour.
+  */
++#ifdef OOT_FIXED_CVARS
++static inline Color_RGB8 CVarGetColor24(const char* name, Color_RGB8 defaultValue) { return defaultValue; }
++#else
+ API_EXPORT Color_RGB8 CVarGetColor24(const char* name, Color_RGB8 defaultValue);
++#endif
+ 
+ /**
+  * @brief Sets the named CVar to an integer value (creates it if it does not exist).
+diff --git a/libultraship/include/libultraship/libultra/abi.h b/libultraship/include/libultraship/libultra/abi.h
+index 3258dd1..e3123cd 100644
+--- a/libultraship/include/libultraship/libultra/abi.h
++++ b/libultraship/include/libultraship/libultra/abi.h
+@@ -6,7 +6,7 @@ typedef unsigned int u32;
+ #define A_SPNOOP 0
+ #define A_ADPCM 1
+ #define A_CLEARBUFF 2
+-#define A_UNK3 3f
++#define A_UNK3 3
+ #define A_ADDMIXER 4
+ #define A_RESAMPLE 5
+ #define A_RESAMPLE_ZOH 6
+@@ -326,12 +326,19 @@ typedef short ENVMIX_STATE[40];
+         _a->words.w1 = _SHIFTL(dmemi, 16, 16) | _SHIFTL(dmemo, 0, 16);     \
+     }
+ 
+-#define aLoadBuffer(pkt, s, d, c)                                                                   \
+-    {                                                                                               \
+-        Acmd* _a = (Acmd*)pkt;                                                                      \
+-                                                                                                    \
+-        _a->words.w0 = (_SHIFTL(A_LOADBUFF, 24, 8) | _SHIFTL((c) >> 4, 16, 8) | _SHIFTL(d, 0, 16)); \
+-        _a->words.w1 = (u32)(s);                                                                    \
++#ifdef OOT_WASM_GUEST
++#define A_LOADBUFF_BLOCKS(c) (((c) + 15) >> 4)
++#else
++#define A_LOADBUFF_BLOCKS(c) ((c) >> 4)
++#endif
++
++#define aLoadBuffer(pkt, s, d, c)                                                                         \
++    {                                                                                                     \
++        Acmd* _a = (Acmd*)pkt;                                                                            \
++                                                                                                          \
++        _a->words.w0 =                                                                                    \
++            (_SHIFTL(A_LOADBUFF, 24, 8) | _SHIFTL(A_LOADBUFF_BLOCKS(c), 16, 8) | _SHIFTL(d, 0, 16));      \
++        _a->words.w1 = (u32)(s);                                                                          \
+     }
+ 
+ #define aMix(pkt, f, g, i, o)                                                             \
+diff --git a/libultraship/src/fast/Fast3dWindow.cpp b/libultraship/src/fast/Fast3dWindow.cpp
+index 2b77a5f..f2f50ad 100644
+--- a/libultraship/src/fast/Fast3dWindow.cpp
++++ b/libultraship/src/fast/Fast3dWindow.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include "fast/Fast3dGui.h"
+ 
++#include <cstdlib>
+ #include <fstream>
+ 
+ namespace Fast {
+@@ -58,6 +59,7 @@ Fast3dWindow::~Fast3dWindow() {
+ }
+ 
+ void Fast3dWindow::Init() {
++    const bool referenceCapture = std::getenv("OOT_FAST3D_COLOR_CAPTURE") != nullptr;
+     bool gameMode = false;
+ 
+ #ifdef __linux__
+@@ -82,8 +84,9 @@ void Fast3dWindow::Init() {
+     uint32_t width, height;
+     int32_t posX, posY;
+ 
+-    isFullscreen =
+-        Ship::Context::GetRawInstance()->GetConfig()->GetBool("Window.Fullscreen.Enabled", false) || gameMode;
++    isFullscreen = !referenceCapture &&
++                   (Ship::Context::GetRawInstance()->GetConfig()->GetBool("Window.Fullscreen.Enabled", false) ||
++                    gameMode);
+     posX = Ship::Context::GetRawInstance()->GetConfig()->GetInt("Window.PositionX", 100);
+     posY = Ship::Context::GetRawInstance()->GetConfig()->GetInt("Window.PositionY", 100);
+ 
+@@ -92,8 +95,8 @@ void Fast3dWindow::Init() {
+         height =
+             Ship::Context::GetRawInstance()->GetConfig()->GetInt("Window.Fullscreen.Height", gameMode ? 800 : 1080);
+     } else {
+-        width = Ship::Context::GetRawInstance()->GetConfig()->GetInt("Window.Width", 640);
+-        height = Ship::Context::GetRawInstance()->GetConfig()->GetInt("Window.Height", 480);
++        width = referenceCapture ? 320 : Ship::Context::GetRawInstance()->GetConfig()->GetInt("Window.Width", 640);
++        height = referenceCapture ? 240 : Ship::Context::GetRawInstance()->GetConfig()->GetInt("Window.Height", 480);
+     }
+     Ship::Context::GetRawInstance()->GetWindow()->SetFullscreenScancode(
+         Ship::Context::GetRawInstance()->GetConfig()->GetInt("Shortcuts.Fullscreen", Ship::KbScancode::LUS_KB_F11));
+@@ -134,7 +137,8 @@ uint16_t Fast3dWindow::GetPixelDepth(float x, float y) {
+ }
+ 
+ void Fast3dWindow::InitWindowManager() {
+-    SetWindowBackend(GetSavedWindowBackend());
++    SetWindowBackend(std::getenv("OOT_FAST3D_COLOR_CAPTURE") != nullptr ? WindowBackend::FAST3D_SDL_OPENGL
++                                                                       : GetSavedWindowBackend());
+ 
+     switch (GetWindowBackend()) {
+ #ifdef ENABLE_DX11
+diff --git a/libultraship/src/fast/backends/gfx_opengl.cpp b/libultraship/src/fast/backends/gfx_opengl.cpp
+index ad9b1dd..695d4a9 100644
+--- a/libultraship/src/fast/backends/gfx_opengl.cpp
++++ b/libultraship/src/fast/backends/gfx_opengl.cpp
+@@ -1020,6 +1020,17 @@ void GfxRenderingAPIOGL::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_
+     glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
+ }
+ 
++bool GfxRenderingAPIOGL::ReadFramebufferDepthToCPU(int fb_id, uint32_t width, uint32_t height, float* depth_buf) {
++    if (fb_id >= (int)mFrameBuffers.size() || !mFrameBuffers[fb_id].has_depth_buffer) {
++        return false;
++    }
++
++    glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[fb_id].fbo);
++    glReadPixels(0, 0, width, height, GL_DEPTH_COMPONENT, GL_FLOAT, depth_buf);
++    glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
++    return true;
++}
++
+ std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
+ GfxRenderingAPIOGL::GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) {
+     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> res;
+diff --git a/libultraship/src/fast/backends/gfx_sdl2.cpp b/libultraship/src/fast/backends/gfx_sdl2.cpp
+index 15c5415..9560405 100644
+--- a/libultraship/src/fast/backends/gfx_sdl2.cpp
++++ b/libultraship/src/fast/backends/gfx_sdl2.cpp
+@@ -1,5 +1,6 @@
+ #if defined(ENABLE_OPENGL) || defined(__APPLE__)
+ 
++#include <cstdlib>
+ #include <stdio.h>
+ 
+ #include "fast/Fast3dWindow.h"
+@@ -376,7 +377,10 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
+ #ifdef __IOS__
+     Uint32 flags = SDL_WINDOW_BORDERLESS | SDL_WINDOW_SHOWN;
+ #else
+-    Uint32 flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
++    Uint32 flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
++    if (std::getenv("OOT_FAST3D_COLOR_CAPTURE") == nullptr) {
++        flags |= SDL_WINDOW_ALLOW_HIGHDPI;
++    }
+ #endif
+ 
+     if (use_opengl) {
+diff --git a/libultraship/src/fast/interpreter.cpp b/libultraship/src/fast/interpreter.cpp
+index 2b51ad7..3aeeb40 100644
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -7,7 +7,7 @@
+ #include <stdbool.h>
+ #include <assert.h>
+ #include <stdio.h>
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__wasm__)
+ #include <dlfcn.h>
+ #endif
+ 
+@@ -28,6 +28,7 @@
+ #include <string>
+ 
+ #include "fast/interpreter.h"
++#include "fast/reference_trace.h"
+ #include "fast/lus_gbi.h"
+ #include "fast/backends/gfx_window_manager_api.h"
+ #include "fast/backends/gfx_rendering_api.h"
+@@ -125,10 +126,10 @@ Interpreter::~Interpreter() {
+     delete[] mBufVbo;
+ }
+ 
+-static std::weak_ptr<Interpreter> mInstance;
+-// Set a cached pointer to the instance so we don't need to go through the window every time
++// Keep the active interpreter alive once, rather than acquiring it for every command.
++static std::shared_ptr<Interpreter> mInstance;
+ void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
+-    mInstance = gfx;
++    mInstance = std::move(gfx);
+ }
+ 
+ // N64 prim_depth is 15-bit (0 near, 0x7FFF far).
+@@ -136,6 +137,7 @@ static constexpr float N64_PRIM_DEPTH_MAX = 32767.0f;
+ 
+ void Interpreter::Flush() {
+     if (mBufVboLen > 0) {
++        ReferenceTraceDraw(this, mBufVbo, mBufVboLen, mBufVboNumTris);
+         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
+         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
+         mBufVboLen = 0;
+@@ -146,6 +148,8 @@ void Interpreter::Flush() {
+ ShaderProgram* Interpreter::LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1) {
+     ShaderProgram* prg = mRapi->LookupShader(id0, id1);
+     if (prg == nullptr) {
++        // Creating the shader also binds it; finish vertices using the previous layout first.
++        Flush();
+         mRapi->UnloadShader(mRenderingState.mShaderProgram);
+         prg = mRapi->CreateAndLoadNewShader(id0, id1);
+         mRenderingState.mShaderProgram = prg;
+@@ -1578,23 +1582,40 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
+ }
+ 
+ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
++    if (n_vertices == 0 || vertices == nullptr) return;
++    // These checks and fog values stay fixed for the whole vertex batch.
++    const bool adjustAspect = !(mFbActive && mActiveFrameBuffer != mFrameBuffers.end() &&
++                               (!mActiveFrameBuffer->second.resize || mActiveFrameBuffer->second.forceFixedAspect));
++    const float aspect = (float)mCurDimensions.width / (float)mCurDimensions.height;
++    const float fogMul = mRsp->fog_mul;
++    const float fogOffset = mRsp->fog_offset;
++    if ((mRsp->geometry_mode & G_LIGHTING) && mRsp->lights_changed) {
++        for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
++            CalculateNormalDir(&mRsp->current_lights[i].l, mRsp->current_lights_coeffs[i]);
++        }
++        /*static const Light_t lookat_x = {{0, 0, 0}, 0, {0, 0, 0}, 0, {127, 0, 0}, 0};
++        static const Light_t lookat_y = {{0, 0, 0}, 0, {0, 0, 0}, 0, {0, 127, 0}, 0};*/
++        CalculateNormalDir(&mRsp->lookat[0], mRsp->current_lookat_coeffs[0]);
++        CalculateNormalDir(&mRsp->lookat[1], mRsp->current_lookat_coeffs[1]);
++        mRsp->lights_changed = false;
++    }
++
++    // Directional lighting is fixed within this batch; alpha and fog are not.
++    const bool cacheLighting = (mRsp->geometry_mode & (G_LIGHTING | G_LIGHTING_POSITIONAL)) == G_LIGHTING;
++    if (cacheLighting) memset(mNormalColors, 0xff, sizeof(mNormalColors));
++    // Keep the matrix in locals across cache writes in the vertex loop.
++    float matrix[4][4];
++    memcpy(matrix, mRsp->MP_matrix, sizeof(matrix));
++
+     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
+         const F3DVtx_t* v = &vertices[i].v;
+         const F3DVtx_tn* vn = &vertices[i].n;
+         struct LoadedVertex* d = &mRsp->loaded_vertices[dest_index];
+ 
+-        if (v == nullptr) {
+-            return;
+-        }
+-
+-        float x = v->ob[0] * mRsp->MP_matrix[0][0] + v->ob[1] * mRsp->MP_matrix[1][0] +
+-                  v->ob[2] * mRsp->MP_matrix[2][0] + mRsp->MP_matrix[3][0];
+-        float y = v->ob[0] * mRsp->MP_matrix[0][1] + v->ob[1] * mRsp->MP_matrix[1][1] +
+-                  v->ob[2] * mRsp->MP_matrix[2][1] + mRsp->MP_matrix[3][1];
+-        float z = v->ob[0] * mRsp->MP_matrix[0][2] + v->ob[1] * mRsp->MP_matrix[1][2] +
+-                  v->ob[2] * mRsp->MP_matrix[2][2] + mRsp->MP_matrix[3][2];
+-        float w = v->ob[0] * mRsp->MP_matrix[0][3] + v->ob[1] * mRsp->MP_matrix[1][3] +
+-                  v->ob[2] * mRsp->MP_matrix[2][3] + mRsp->MP_matrix[3][3];
++        float x = v->ob[0] * matrix[0][0] + v->ob[1] * matrix[1][0] + v->ob[2] * matrix[2][0] + matrix[3][0];
++        float y = v->ob[0] * matrix[0][1] + v->ob[1] * matrix[1][1] + v->ob[2] * matrix[2][1] + matrix[3][1];
++        float z = v->ob[0] * matrix[0][2] + v->ob[1] * matrix[1][2] + v->ob[2] * matrix[2][2] + matrix[3][2];
++        float w = v->ob[0] * matrix[0][3] + v->ob[1] * matrix[1][3] + v->ob[2] * matrix[2][3] + matrix[3][3];
+ 
+         float world_pos[3] = { 0.0 };
+         if (mRsp->geometry_mode & G_LIGHTING_POSITIONAL) {
+@@ -1604,82 +1625,79 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
+             world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
+         }
+ 
+-        x = AdjXForAspectRatio(x);
++        if (adjustAspect) x = x * (4.0f / 3.0f) / aspect;
+ 
+         short U = v->tc[0] * mRsp->texture_scaling_factor.s >> 16;
+         short V = v->tc[1] * mRsp->texture_scaling_factor.t >> 16;
+ 
+         if (mRsp->geometry_mode & G_LIGHTING) {
+-            if (mRsp->lights_changed) {
++            const uint32_t normal = (uint8_t)vn->n[0] | (uint32_t)(uint8_t)vn->n[1] << 8 |
++                                    (uint32_t)(uint8_t)vn->n[2] << 16;
++            NormalColor& cached = mNormalColors[(normal * 2654435761u) >> 26];
++            if (cacheLighting && cached.normal == normal) {
++                d->color = cached.color;
++            } else {
++                int r = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[0];
++                int g = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[1];
++                int b = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[2];
++
+                 for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
+-                    CalculateNormalDir(&mRsp->current_lights[i].l, mRsp->current_lights_coeffs[i]);
+-                }
+-                /*static const Light_t lookat_x = {{0, 0, 0}, 0, {0, 0, 0}, 0, {127, 0, 0}, 0};
+-                static const Light_t lookat_y = {{0, 0, 0}, 0, {0, 0, 0}, 0, {0, 127, 0}, 0};*/
+-                CalculateNormalDir(&mRsp->lookat[0], mRsp->current_lookat_coeffs[0]);
+-                CalculateNormalDir(&mRsp->lookat[1], mRsp->current_lookat_coeffs[1]);
+-                mRsp->lights_changed = false;
+-            }
++                    float intensity = 0;
++                    if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) && (mRsp->current_lights[i].p.unk3 != 0)) {
++                        // Calculate distance from the light to the vertex
++                        float dist_vec[3] = { mRsp->current_lights[i].p.pos[0] - world_pos[0],
++                                              mRsp->current_lights[i].p.pos[1] - world_pos[1],
++                                              mRsp->current_lights[i].p.pos[2] - world_pos[2] };
++                        float dist_sq =
++                            dist_vec[0] * dist_vec[0] + dist_vec[1] * dist_vec[1] +
++                            dist_vec[2] * dist_vec[2] * 2; // The *2 comes from GLideN64, unsure of why it does it
++                        float dist = sqrt(dist_sq);
++
++                        // Transform distance vector (which acts as a direction light vector) into model's space
++                        float light_model[3];
++                        TransposedMatrixMul(light_model, dist_vec,
++                                            mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1]);
++
++                        // Calculate intensity for each axis using standard formula for intensity
++                        float light_intensity[3];
++                        for (int light_i = 0; light_i < 3; light_i++) {
++                            light_intensity[light_i] = 4.0f * light_model[light_i] / dist_sq;
++                            light_intensity[light_i] = std::clamp(light_intensity[light_i], -1.0f, 1.0f);
++                        }
+ 
+-            int r = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[0];
+-            int g = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[1];
+-            int b = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[2];
+-
+-            for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
+-                float intensity = 0;
+-                if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) && (mRsp->current_lights[i].p.unk3 != 0)) {
+-                    // Calculate distance from the light to the vertex
+-                    float dist_vec[3] = { mRsp->current_lights[i].p.pos[0] - world_pos[0],
+-                                          mRsp->current_lights[i].p.pos[1] - world_pos[1],
+-                                          mRsp->current_lights[i].p.pos[2] - world_pos[2] };
+-                    float dist_sq =
+-                        dist_vec[0] * dist_vec[0] + dist_vec[1] * dist_vec[1] +
+-                        dist_vec[2] * dist_vec[2] * 2; // The *2 comes from GLideN64, unsure of why it does it
+-                    float dist = sqrt(dist_sq);
+-
+-                    // Transform distance vector (which acts as a direction light vector) into model's space
+-                    float light_model[3];
+-                    TransposedMatrixMul(light_model, dist_vec,
+-                                        mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1]);
+-
+-                    // Calculate intensity for each axis using standard formula for intensity
+-                    float light_intensity[3];
+-                    for (int light_i = 0; light_i < 3; light_i++) {
+-                        light_intensity[light_i] = 4.0f * light_model[light_i] / dist_sq;
+-                        light_intensity[light_i] = std::clamp(light_intensity[light_i], -1.0f, 1.0f);
++                        // Adjust intensity based on surface normal and sum up total
++                        float total_intensity =
++                            light_intensity[0] * vn->n[0] + light_intensity[1] * vn->n[1] + light_intensity[2] * vn->n[2];
++                        total_intensity = std::clamp(total_intensity, -1.0f, 1.0f);
++
++                        // Attenuate intensity based on attenuation values.
++                        // Example formula found at https://ogldev.org/www/tutorial20/tutorial20.html
++                        // Specific coefficients for MM's microcode sourced from GLideN64
++                        // https://github.com/gonetz/GLideN64/blob/3b43a13a80dfc2eb6357673440b335e54eaa3896/src/gSP.cpp#L636
++                        float distf = floorf(dist);
++                        float attenuation = (distf * mRsp->current_lights[i].p.unk7 * 2.0f +
++                                             distf * distf * mRsp->current_lights[i].p.unkE / 8.0f) /
++                                                (float)0xFFFF +
++                                            1.0f;
++                        intensity = total_intensity / attenuation;
++                    } else {
++                        intensity += vn->n[0] * mRsp->current_lights_coeffs[i][0];
++                        intensity += vn->n[1] * mRsp->current_lights_coeffs[i][1];
++                        intensity += vn->n[2] * mRsp->current_lights_coeffs[i][2];
++                        intensity /= 127.0f;
++                    }
++                    if (intensity > 0.0f) {
++                        r += intensity * mRsp->current_lights[i].l.col[0];
++                        g += intensity * mRsp->current_lights[i].l.col[1];
++                        b += intensity * mRsp->current_lights[i].l.col[2];
+                     }
+-
+-                    // Adjust intensity based on surface normal and sum up total
+-                    float total_intensity =
+-                        light_intensity[0] * vn->n[0] + light_intensity[1] * vn->n[1] + light_intensity[2] * vn->n[2];
+-                    total_intensity = std::clamp(total_intensity, -1.0f, 1.0f);
+-
+-                    // Attenuate intensity based on attenuation values.
+-                    // Example formula found at https://ogldev.org/www/tutorial20/tutorial20.html
+-                    // Specific coefficients for MM's microcode sourced from GLideN64
+-                    // https://github.com/gonetz/GLideN64/blob/3b43a13a80dfc2eb6357673440b335e54eaa3896/src/gSP.cpp#L636
+-                    float distf = floorf(dist);
+-                    float attenuation = (distf * mRsp->current_lights[i].p.unk7 * 2.0f +
+-                                         distf * distf * mRsp->current_lights[i].p.unkE / 8.0f) /
+-                                            (float)0xFFFF +
+-                                        1.0f;
+-                    intensity = total_intensity / attenuation;
+-                } else {
+-                    intensity += vn->n[0] * mRsp->current_lights_coeffs[i][0];
+-                    intensity += vn->n[1] * mRsp->current_lights_coeffs[i][1];
+-                    intensity += vn->n[2] * mRsp->current_lights_coeffs[i][2];
+-                    intensity /= 127.0f;
+-                }
+-                if (intensity > 0.0f) {
+-                    r += intensity * mRsp->current_lights[i].l.col[0];
+-                    g += intensity * mRsp->current_lights[i].l.col[1];
+-                    b += intensity * mRsp->current_lights[i].l.col[2];
+                 }
+-            }
+ 
+-            d->color.r = r > 255 ? 255 : r;
+-            d->color.g = g > 255 ? 255 : g;
+-            d->color.b = b > 255 ? 255 : b;
++                d->color.r = r > 255 ? 255 : r;
++                d->color.g = g > 255 ? 255 : g;
++                d->color.b = b > 255 ? 255 : b;
++                if (cacheLighting) cached = { normal, { d->color.r, d->color.g, d->color.b, 0 } };
++            }
+ 
+             if (mRsp->geometry_mode & G_TEXTURE_GEN) {
+                 float dotx = 0, doty = 0;
+@@ -1756,12 +1774,13 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
+                 winv = std::numeric_limits<int16_t>::max();
+             }
+ 
+-            float fog_z = z * winv * mRsp->fog_mul + mRsp->fog_offset;
++            float fog_z = z * winv * fogMul + fogOffset;
+             fog_z = Ship::Math::clamp(fog_z, 0.0f, 255.0f);
+             d->color.a = fog_z; // Use alpha variable to store fog factor
+         } else {
+             d->color.a = v->cn[3];
+         }
++        ReferenceTraceVertex(this, dest_index, *d);
+     }
+ }
+ 
+@@ -1786,6 +1805,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
+ 
+     if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
+         // The whole triangle lies outside the visible area
++        ReferenceTraceTriangle(this, vtx1_idx, vtx2_idx, vtx3_idx, "TriviallyClipped");
+         return;
+     }
+ 
+@@ -1816,290 +1836,385 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
+ 
+         if (cull_type == cull_front) {
+             if (cross <= 0) {
++                ReferenceTraceTriangle(this, vtx1_idx, vtx2_idx, vtx3_idx, "CulledFront");
+                 return;
+             }
+         } else if (cull_type == cull_back) {
+             if (cross >= 0) {
++                ReferenceTraceTriangle(this, vtx1_idx, vtx2_idx, vtx3_idx, "CulledBack");
+                 return;
+             }
+         } else if (cull_type == cull_both) {
+             // Why is this even an option?
++            ReferenceTraceTriangle(this, vtx1_idx, vtx2_idx, vtx3_idx, "CulledBoth");
+             return;
+         }
+     }
+ 
+-    // depth_test is set when the fragment has a depth value to compare (either from vertex Z via
+-    // RSP G_ZBUFFER, or from the prim-depth register via G_ZS_PRIM) and Z_CMP is requested.
+-    bool zbuffer_enabled = (mRsp->geometry_mode & G_ZBUFFER) == G_ZBUFFER;
+-    bool prim_depth_enabled = (mRdp->other_mode_l & G_ZS_PRIM) != 0;
+-    bool depth_test = (zbuffer_enabled || prim_depth_enabled) && (mRdp->other_mode_l & Z_CMP) == Z_CMP;
+-    bool depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
+-    uint8_t depth_test_and_mask = (depth_test ? 1 : 0) | (depth_mask ? 2 : 0);
+-    if (depth_test_and_mask != mRenderingState.depth_test_and_mask) {
+-        Flush();
+-        mRapi->SetDepthTestAndMask(depth_test, depth_mask);
+-        mRenderingState.depth_test_and_mask = depth_test_and_mask;
+-    }
+-
+-    bool zmode_decal = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_DEC;
+-    if (zmode_decal != mRenderingState.decal_mode) {
+-        Flush();
+-        mRapi->SetZmodeDecal(zmode_decal);
+-        mRenderingState.decal_mode = zmode_decal;
+-    }
+-
+-    if (mRdp->viewport_or_scissor_changed) {
+-        if (memcmp(&mRdp->viewport, &mRenderingState.viewport, sizeof(mRdp->viewport)) != 0) {
++    auto& state = mTriangleState;
++    if (!state.valid || is_rect) {
++        memset(mPackedVertexLengths, 0, sizeof(mPackedVertexLengths));
++        // depth_test is set when the fragment has a depth value to compare (either from vertex Z via
++        // RSP G_ZBUFFER, or from the prim-depth register via G_ZS_PRIM) and Z_CMP is requested.
++        bool zbuffer_enabled = (mRsp->geometry_mode & G_ZBUFFER) == G_ZBUFFER;
++        bool prim_depth_enabled = (mRdp->other_mode_l & G_ZS_PRIM) != 0;
++        bool depth_test = (zbuffer_enabled || prim_depth_enabled) && (mRdp->other_mode_l & Z_CMP) == Z_CMP;
++        bool depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
++        uint8_t depth_test_and_mask = (depth_test ? 1 : 0) | (depth_mask ? 2 : 0);
++        if (depth_test_and_mask != mRenderingState.depth_test_and_mask) {
+             Flush();
+-            mRapi->SetViewport(mRdp->viewport.x, mRdp->viewport.y, mRdp->viewport.width, mRdp->viewport.height);
+-            mRenderingState.viewport = mRdp->viewport;
++            mRapi->SetDepthTestAndMask(depth_test, depth_mask);
++            mRenderingState.depth_test_and_mask = depth_test_and_mask;
+         }
+-        if (memcmp(&mRdp->scissor, &mRenderingState.scissor, sizeof(mRdp->scissor)) != 0) {
++
++        bool zmode_decal = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_DEC;
++        if (zmode_decal != mRenderingState.decal_mode) {
+             Flush();
+-            mRapi->SetScissor(mRdp->scissor.x, mRdp->scissor.y, mRdp->scissor.width, mRdp->scissor.height);
+-            mRenderingState.scissor = mRdp->scissor;
++            mRapi->SetZmodeDecal(zmode_decal);
++            mRenderingState.decal_mode = zmode_decal;
+         }
+-        mRdp->viewport_or_scissor_changed = false;
+-    }
+-
+-    uint64_t cc_id = mRdp->combine_mode;
+-    uint64_t cc_options = 0;
+-    bool use_alpha = ((mRdp->other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20) &&
+-                      (mRdp->other_mode_l & (3 << 16)) == (G_BL_1MA << 16)) ||
+-                     ((mRdp->other_mode_l & (3 << 22)) == (G_BL_CLR_MEM << 22) &&
+-                      (mRdp->other_mode_l & (3 << 18)) == (G_BL_1MA << 18));
+-    uint8_t blend_src = mRdp->other_mode_l >> 30;
+-    bool use_blend_color = blend_src == G_BL_CLR_BL;
+-    bool use_fog = blend_src == G_BL_CLR_FOG || use_blend_color;
+-    bool texture_edge = (mRdp->other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA;
+-    bool use_noise = (mRdp->other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_DITHER;
+-    bool use_2cyc = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE;
+-    bool alpha_threshold = (mRdp->other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_THRESHOLD;
+-    bool invisible =
+-        (mRdp->other_mode_l & (3 << 24)) == (G_BL_0 << 24) && (mRdp->other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20);
+-    bool use_grayscale = mRdp->grayscale;
+-    bool use_prim_depth = (mRdp->other_mode_l & G_ZS_PRIM) != 0;
+-
+-    if (texture_edge) {
+-        if (use_alpha) {
+-            alpha_threshold = true;
+-            texture_edge = false;
++
++        if (mRdp->viewport_or_scissor_changed) {
++            if (memcmp(&mRdp->viewport, &mRenderingState.viewport, sizeof(mRdp->viewport)) != 0) {
++                Flush();
++                mRapi->SetViewport(mRdp->viewport.x, mRdp->viewport.y, mRdp->viewport.width, mRdp->viewport.height);
++                mRenderingState.viewport = mRdp->viewport;
++            }
++            if (memcmp(&mRdp->scissor, &mRenderingState.scissor, sizeof(mRdp->scissor)) != 0) {
++                Flush();
++                mRapi->SetScissor(mRdp->scissor.x, mRdp->scissor.y, mRdp->scissor.width, mRdp->scissor.height);
++                mRenderingState.scissor = mRdp->scissor;
++            }
++            mRdp->viewport_or_scissor_changed = false;
+         }
+-        use_alpha = true;
+-    }
+ 
+-    if (use_alpha) {
+-        cc_options |= SHADER_OPT(ALPHA);
+-    }
+-    if (use_fog) {
+-        cc_options |= SHADER_OPT(FOG);
+-    }
+-    if (texture_edge) {
+-        cc_options |= SHADER_OPT(TEXTURE_EDGE);
+-    }
+-    if (use_noise) {
+-        cc_options |= SHADER_OPT(NOISE);
+-    }
+-    if (use_2cyc) {
+-        cc_options |= SHADER_OPT(_2CYC);
+-    }
+-    if (alpha_threshold) {
+-        cc_options |= SHADER_OPT(ALPHA_THRESHOLD);
+-    }
+-    if (invisible) {
+-        cc_options |= SHADER_OPT(INVISIBLE);
+-    }
+-    if (use_grayscale) {
+-        cc_options |= SHADER_OPT(GRAYSCALE);
+-    }
+-    if (use_prim_depth) {
+-        cc_options |= SHADER_OPT(PRIM_DEPTH);
+-    }
++        uint64_t cc_id = mRdp->combine_mode;
++        uint64_t cc_options = 0;
++        bool use_alpha = ((mRdp->other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20) &&
++                          (mRdp->other_mode_l & (3 << 16)) == (G_BL_1MA << 16)) ||
++                         ((mRdp->other_mode_l & (3 << 22)) == (G_BL_CLR_MEM << 22) &&
++                          (mRdp->other_mode_l & (3 << 18)) == (G_BL_1MA << 18));
++        uint8_t blend_src = mRdp->other_mode_l >> 30;
++        bool use_blend_color = blend_src == G_BL_CLR_BL;
++        bool use_fog = blend_src == G_BL_CLR_FOG || use_blend_color;
++        bool texture_edge = (mRdp->other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA;
++        bool use_noise = (mRdp->other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_DITHER;
++        bool use_2cyc = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE;
++        bool alpha_threshold = (mRdp->other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_THRESHOLD;
++        bool invisible =
++            (mRdp->other_mode_l & (3 << 24)) == (G_BL_0 << 24) && (mRdp->other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20);
++        bool use_grayscale = mRdp->grayscale;
++        bool use_prim_depth = (mRdp->other_mode_l & G_ZS_PRIM) != 0;
++
++        if (texture_edge) {
++            if (use_alpha) {
++                alpha_threshold = true;
++                texture_edge = false;
++            }
++            use_alpha = true;
++        }
+ 
+-    if (!mShaderStack.empty()) {
+-        cc_options |= (mShaderStack.top() << SHADER_ID_SHIFT);
+-    } else {
+-        cc_options |= -1 << SHADER_ID_SHIFT;
+-    }
++        if (use_alpha) {
++            cc_options |= SHADER_OPT(ALPHA);
++        }
++        if (use_fog) {
++            cc_options |= SHADER_OPT(FOG);
++        }
++        if (texture_edge) {
++            cc_options |= SHADER_OPT(TEXTURE_EDGE);
++        }
++        if (use_noise) {
++            cc_options |= SHADER_OPT(NOISE);
++        }
++        if (use_2cyc) {
++            cc_options |= SHADER_OPT(_2CYC);
++        }
++        if (alpha_threshold) {
++            cc_options |= SHADER_OPT(ALPHA_THRESHOLD);
++        }
++        if (invisible) {
++            cc_options |= SHADER_OPT(INVISIBLE);
++        }
++        if (use_grayscale) {
++            cc_options |= SHADER_OPT(GRAYSCALE);
++        }
++        if (use_prim_depth) {
++            cc_options |= SHADER_OPT(PRIM_DEPTH);
++        }
+ 
+-    if (mRdp->loaded_texture[0].masked) {
+-        cc_options |= SHADER_OPT(TEXEL0_MASK);
+-    }
+-    if (mRdp->loaded_texture[1].masked) {
+-        cc_options |= SHADER_OPT(TEXEL1_MASK);
+-    }
+-    if (mRdp->loaded_texture[0].blended) {
+-        cc_options |= SHADER_OPT(TEXEL0_BLEND);
+-    }
+-    if (mRdp->loaded_texture[1].blended) {
+-        cc_options |= SHADER_OPT(TEXEL1_BLEND);
+-    }
++        if (!mShaderStack.empty()) {
++            cc_options |= (mShaderStack.top() << SHADER_ID_SHIFT);
++        } else {
++            cc_options |= -1 << SHADER_ID_SHIFT;
++        }
+ 
+-    ColorCombinerKey key;
+-    key.combine_mode = mRdp->combine_mode;
+-    key.options = cc_options;
++        if (mRdp->loaded_texture[0].masked) {
++            cc_options |= SHADER_OPT(TEXEL0_MASK);
++        }
++        if (mRdp->loaded_texture[1].masked) {
++            cc_options |= SHADER_OPT(TEXEL1_MASK);
++        }
++        if (mRdp->loaded_texture[0].blended) {
++            cc_options |= SHADER_OPT(TEXEL0_BLEND);
++        }
++        if (mRdp->loaded_texture[1].blended) {
++            cc_options |= SHADER_OPT(TEXEL1_BLEND);
++        }
+ 
+-    ColorCombiner* comb = LookupOrCreateColorCombiner(key);
++        ColorCombinerKey key;
++        key.combine_mode = mRdp->combine_mode;
++        key.options = cc_options;
+ 
+-    uint32_t tm = 0;
+-    uint32_t tex_width[2], tex_height[2], tex_width2[2], tex_height2[2];
+-    uint32_t effective_tile[2];
++        ColorCombiner* comb = LookupOrCreateColorCombiner(key);
+ 
+-    for (int i = 0; i < 2; i++) {
+-        uint32_t tile = mRdp->first_tile_index + i;
++        uint32_t tm = 0;
++        auto& tex_width = state.tex_width;
++        auto& tex_height = state.tex_height;
++        auto& tex_width2 = state.tex_width2;
++        auto& tex_height2 = state.tex_height2;
++        auto& effective_tile = state.effective_tile;
+ 
+-        // No LOD support: force both slots to the base mip level.
+-        if (i == 1 && mRdp->first_tile_index >= 2) {
+-            tile = mRdp->first_tile_index;
+-        }
+-        effective_tile[i] = tile;
++        for (int i = 0; i < 2; i++) {
++            uint32_t tile = mRdp->first_tile_index + i;
+ 
+-        if (comb->usedTextures[i]) {
+-            if (mRdp->textures_changed[i]) {
+-                Flush();
+-                ImportTexture(i, tile, false);
+-                if (mRdp->loaded_texture[i].masked) {
+-                    ImportTextureMask(SHADER_FIRST_MASK_TEXTURE + i, tile);
++            // No LOD support: force both slots to the base mip level.
++            if (i == 1 && mRdp->first_tile_index >= 2) {
++                tile = mRdp->first_tile_index;
++            }
++            effective_tile[i] = tile;
++
++            if (comb->usedTextures[i]) {
++                if (mRdp->textures_changed[i]) {
++                    Flush();
++                    ImportTexture(i, tile, false);
++                    if (mRdp->loaded_texture[i].masked) {
++                        ImportTextureMask(SHADER_FIRST_MASK_TEXTURE + i, tile);
++                    }
++                    if (mRdp->loaded_texture[i].blended) {
++                        ImportTexture(SHADER_FIRST_REPLACEMENT_TEXTURE + i, tile, true);
++                    }
++                    mRdp->textures_changed[i] = false;
+                 }
+-                if (mRdp->loaded_texture[i].blended) {
+-                    ImportTexture(SHADER_FIRST_REPLACEMENT_TEXTURE + i, tile, true);
++
++                uint8_t cms = mRdp->texture_tile[tile].cms;
++                uint8_t cmt = mRdp->texture_tile[tile].cmt;
++
++                uint32_t loaded_line_size = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes;
++                uint32_t loaded_size = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].size_bytes;
++                uint32_t loaded_full_line =
++                    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes;
++                uint32_t tex_size_bytes;
++                uint32_t line_size;
++                if ((loaded_line_size != loaded_size || loaded_full_line != loaded_size) && loaded_line_size > 0) {
++                    line_size = loaded_line_size;
++                    tex_size_bytes = loaded_size;
++                } else {
++                    line_size = mRdp->texture_tile[tile].line_size_bytes;
++                    tex_size_bytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes;
++                    // RGBA32: texture_tile stores TMEM-interleaved stride (half of actual DRAM stride).
++                    if (mRdp->texture_tile[tile].siz == G_IM_SIZ_32b) {
++                        line_size *= 2;
++                    }
+                 }
+-                mRdp->textures_changed[i] = false;
+-            }
+ 
+-            uint8_t cms = mRdp->texture_tile[tile].cms;
+-            uint8_t cmt = mRdp->texture_tile[tile].cmt;
+-
+-            uint32_t loaded_line_size = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes;
+-            uint32_t loaded_size = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].size_bytes;
+-            uint32_t loaded_full_line =
+-                mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes;
+-            uint32_t tex_size_bytes;
+-            uint32_t line_size;
+-            if ((loaded_line_size != loaded_size || loaded_full_line != loaded_size) && loaded_line_size > 0) {
+-                line_size = loaded_line_size;
+-                tex_size_bytes = loaded_size;
+-            } else {
+-                line_size = mRdp->texture_tile[tile].line_size_bytes;
+-                tex_size_bytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes;
+-                // RGBA32: texture_tile stores TMEM-interleaved stride (half of actual DRAM stride).
+-                if (mRdp->texture_tile[tile].siz == G_IM_SIZ_32b) {
+-                    line_size *= 2;
++                if (line_size == 0) {
++                    line_size = 1;
+                 }
+-            }
+ 
+-            if (line_size == 0) {
+-                line_size = 1;
+-            }
++                tex_height[i] = tex_size_bytes / line_size;
++                switch (mRdp->texture_tile[tile].siz) {
++                    case G_IM_SIZ_4b:
++                        line_size <<= 1;
++                        break;
++                    case G_IM_SIZ_8b:
++                        break;
++                    case G_IM_SIZ_16b:
++                        line_size /= G_IM_SIZ_16b_LINE_BYTES;
++                        break;
++                    case G_IM_SIZ_32b:
++                        line_size /= 4; // RGBA32: 4 bytes per pixel (line_size is now actual DRAM stride)
++                        break;
++                }
++                tex_width[i] = line_size;
++
++                tex_width2[i] = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].uls, mRdp->texture_tile[tile].lrs);
++                tex_height2[i] = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrt);
++
++                // Same pyramid-like ratio gate as ImportTexture: only clamp when loaded pixels
++                // are close to rendered pixels (mipmap), not when much bigger (window scroll).
++                const RawTexMetadata& triMeta = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
++                bool pyrLike = IsPyramidLike(tex_width[i], tex_height[i], tex_width2[i], tex_height2[i],
++                                            triMeta.h_byte_scale, triMeta.v_pixel_scale);
++                // Same wrap-period trim as the import paths. The >= tex_width2 guard skips a stale
++                // mask left by an FB blit (the pause background), which would otherwise tile the FB.
++                uint32_t maskW = mRdp->texture_tile[tile].masks;
++                uint32_t maskH = mRdp->texture_tile[tile].maskt;
++                if (maskW != 0 && (1u << maskW) >= tex_width2[i] && (1u << maskW) < tex_width[i]) {
++                    tex_width[i] = 1u << maskW;
++                }
++                if (maskH != 0 && (1u << maskH) >= tex_height2[i] && (1u << maskH) < tex_height[i]) {
++                    tex_height[i] = 1u << maskH;
++                }
++                if ((pyrLike || (cms & G_TX_CLAMP)) && tex_width2[i] > 0 && tex_width2[i] < tex_width[i]) {
++                    tex_width[i] = tex_width2[i];
++                }
++                if ((pyrLike || (cmt & G_TX_CLAMP)) && tex_height2[i] > 0 && tex_height2[i] < tex_height[i]) {
++                    tex_height[i] = tex_height2[i];
++                }
+ 
+-            tex_height[i] = tex_size_bytes / line_size;
+-            switch (mRdp->texture_tile[tile].siz) {
+-                case G_IM_SIZ_4b:
+-                    line_size <<= 1;
+-                    break;
+-                case G_IM_SIZ_8b:
+-                    break;
+-                case G_IM_SIZ_16b:
+-                    line_size /= G_IM_SIZ_16b_LINE_BYTES;
+-                    break;
+-                case G_IM_SIZ_32b:
+-                    line_size /= 4; // RGBA32: 4 bytes per pixel (line_size is now actual DRAM stride)
+-                    break;
+-            }
+-            tex_width[i] = line_size;
+-
+-            tex_width2[i] = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].uls, mRdp->texture_tile[tile].lrs);
+-            tex_height2[i] = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrt);
+-
+-            // Same pyramid-like ratio gate as ImportTexture: only clamp when loaded pixels
+-            // are close to rendered pixels (mipmap), not when much bigger (window scroll).
+-            const RawTexMetadata& triMeta = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
+-            bool pyrLike = IsPyramidLike(tex_width[i], tex_height[i], tex_width2[i], tex_height2[i],
+-                                         triMeta.h_byte_scale, triMeta.v_pixel_scale);
+-            // Same wrap-period trim as the import paths. The >= tex_width2 guard skips a stale
+-            // mask left by an FB blit (the pause background), which would otherwise tile the FB.
+-            uint32_t maskW = mRdp->texture_tile[tile].masks;
+-            uint32_t maskH = mRdp->texture_tile[tile].maskt;
+-            if (maskW != 0 && (1u << maskW) >= tex_width2[i] && (1u << maskW) < tex_width[i]) {
+-                tex_width[i] = 1u << maskW;
+-            }
+-            if (maskH != 0 && (1u << maskH) >= tex_height2[i] && (1u << maskH) < tex_height[i]) {
+-                tex_height[i] = 1u << maskH;
+-            }
+-            if ((pyrLike || (cms & G_TX_CLAMP)) && tex_width2[i] > 0 && tex_width2[i] < tex_width[i]) {
+-                tex_width[i] = tex_width2[i];
+-            }
+-            if ((pyrLike || (cmt & G_TX_CLAMP)) && tex_height2[i] > 0 && tex_height2[i] < tex_height[i]) {
+-                tex_height[i] = tex_height2[i];
+-            }
++                uint32_t tex_width1 = tex_width[i] << (cms & G_TX_MIRROR);
++                uint32_t tex_height1 = tex_height[i] << (cmt & G_TX_MIRROR);
+ 
+-            uint32_t tex_width1 = tex_width[i] << (cms & G_TX_MIRROR);
+-            uint32_t tex_height1 = tex_height[i] << (cmt & G_TX_MIRROR);
++                if ((cms & G_TX_CLAMP) && ((cms & G_TX_MIRROR) || tex_width1 != tex_width2[i])) {
++                    tm |= 1 << 2 * i;
++                    cms &= ~G_TX_CLAMP;
++                }
++                if ((cmt & G_TX_CLAMP) && ((cmt & G_TX_MIRROR) || tex_height1 != tex_height2[i])) {
++                    tm |= 1 << 2 * i + 1;
++                    cmt &= ~G_TX_CLAMP;
++                }
+ 
+-            if ((cms & G_TX_CLAMP) && ((cms & G_TX_MIRROR) || tex_width1 != tex_width2[i])) {
+-                tm |= 1 << 2 * i;
+-                cms &= ~G_TX_CLAMP;
+-            }
+-            if ((cmt & G_TX_CLAMP) && ((cmt & G_TX_MIRROR) || tex_height1 != tex_height2[i])) {
+-                tm |= 1 << 2 * i + 1;
+-                cmt &= ~G_TX_CLAMP;
+-            }
++                if (mRenderingState.mTextures[i] == nullptr) {
++                    continue;
++                }
+ 
+-            if (mRenderingState.mTextures[i] == nullptr) {
+-                continue;
+-            }
++                bool linear_filter = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
++                if (linear_filter != mRenderingState.mTextures[i]->second.linear_filter ||
++                    cms != mRenderingState.mTextures[i]->second.cms || cmt != mRenderingState.mTextures[i]->second.cmt) {
++                    Flush();
+ 
+-            bool linear_filter = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
+-            if (linear_filter != mRenderingState.mTextures[i]->second.linear_filter ||
+-                cms != mRenderingState.mTextures[i]->second.cms || cmt != mRenderingState.mTextures[i]->second.cmt) {
+-                Flush();
++                    // Set the same sampler params on the blended texture. Needed for opengl.
++                    if (mRdp->loaded_texture[i].blended) {
++                        mRapi->SetSamplerParameters(SHADER_FIRST_REPLACEMENT_TEXTURE + i, linear_filter, cms, cmt);
++                    }
+ 
+-                // Set the same sampler params on the blended texture. Needed for opengl.
+-                if (mRdp->loaded_texture[i].blended) {
+-                    mRapi->SetSamplerParameters(SHADER_FIRST_REPLACEMENT_TEXTURE + i, linear_filter, cms, cmt);
++                    mRapi->SetSamplerParameters(i, linear_filter, cms, cmt);
++                    mRenderingState.mTextures[i]->second.linear_filter = linear_filter;
++                    mRenderingState.mTextures[i]->second.cms = cms;
++                    mRenderingState.mTextures[i]->second.cmt = cmt;
+                 }
+-
+-                mRapi->SetSamplerParameters(i, linear_filter, cms, cmt);
+-                mRenderingState.mTextures[i]->second.linear_filter = linear_filter;
+-                mRenderingState.mTextures[i]->second.cms = cms;
+-                mRenderingState.mTextures[i]->second.cmt = cmt;
+             }
+         }
+-    }
+ 
+-    struct ShaderProgram* prg = comb->prg[tm];
+-    if (prg == NULL) {
+-        comb->prg[tm] = prg =
+-            LookupOrCreateShaderProgram(comb->shader_id0, comb->shader_id1 | tm * SHADER_OPT(TEXEL0_CLAMP_S));
+-    }
+-    if (prg != mRenderingState.mShaderProgram) {
+-        Flush();
+-        mRapi->UnloadShader(mRenderingState.mShaderProgram);
+-        mRapi->LoadShader(prg);
+-        mRenderingState.mShaderProgram = prg;
+-    }
+-    if (use_alpha != mRenderingState.alpha_blend) {
+-        Flush();
+-        mRapi->SetUseAlpha(use_alpha);
+-        mRenderingState.alpha_blend = use_alpha;
+-    }
+-    uint8_t numInputs;
+-    bool usedTextures[2];
+-
+-    mRapi->ShaderGetInfo(prg, &numInputs, usedTextures);
+-
+-    struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
++        struct ShaderProgram* prg = comb->prg[tm];
++        if (prg == NULL) {
++            comb->prg[tm] = prg =
++                LookupOrCreateShaderProgram(comb->shader_id0, comb->shader_id1 | tm * SHADER_OPT(TEXEL0_CLAMP_S));
++        }
++        if (prg != mRenderingState.mShaderProgram) {
++            Flush();
++            mRapi->UnloadShader(mRenderingState.mShaderProgram);
++            mRapi->LoadShader(prg);
++            mRenderingState.mShaderProgram = prg;
++        }
++        if (use_alpha != mRenderingState.alpha_blend) {
++            Flush();
++            mRapi->SetUseAlpha(use_alpha);
++            mRenderingState.alpha_blend = use_alpha;
++        }
++        uint8_t numInputs;
++        bool usedTextures[2];
++
++        mRapi->ShaderGetInfo(prg, &numInputs, usedTextures);
++
++        struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
++        state.comb = comb;
++        state.tm = tm;
++        state.numInputs = numInputs;
++        state.use_alpha = use_alpha;
++        state.use_fog = use_fog;
++        state.use_blend_color = use_blend_color;
++        state.use_grayscale = use_grayscale;
++        state.clip_parameters = clip_parameters;
++        state.triangle_lod = false;
++        if (mRdp->other_mode_l & G_TL_LOD) {
++            for (int j = 0; j < numInputs; j++) {
++                for (int k = 0; k < 1 + (use_alpha ? 1 : 0); k++) {
++                    state.triangle_lod |= comb->shader_input_mapping[k][j] == G_CCMUX_LOD_FRACTION;
++                }
++            }
++        }
++        std::copy_n(usedTextures, 2, state.usedTextures);
++        // Rectangles temporarily change state inside their command handler.
++        state.valid = !is_rect;
++    }
++    const auto comb = state.comb;
++    const auto tm = state.tm;
++    const auto numInputs = state.numInputs;
++    const auto use_alpha = state.use_alpha;
++    const auto use_fog = state.use_fog;
++    const auto use_blend_color = state.use_blend_color;
++    const auto use_grayscale = state.use_grayscale;
++    const auto clip_parameters = state.clip_parameters;
++    const auto& tex_width = state.tex_width;
++    const auto& tex_height = state.tex_height;
++    const auto& tex_width2 = state.tex_width2;
++    const auto& tex_height2 = state.tex_height2;
++    const auto& effective_tile = state.effective_tile;
++    const auto& usedTextures = state.usedTextures;
++
++    float traceGeometry[3 * 13];
++    size_t traceGeometryLength = 0;
++    float lodFraction = 1.0f;
++    if (mRdp->other_mode_l & G_TL_LOD) {
++        lodFraction = Ship::Math::clamp((v1->w - 3000.0f) / 3000.0f, 0.0f, 1.0f);
++    }
++
++    auto textureCoordinate = [&](const LoadedVertex* vertex, int texture, bool horizontal) {
++        if (!usedTextures[texture]) {
++            return 0.0f;
++        }
++        float coordinate = (horizontal ? vertex->u : vertex->v) / 32.0f;
++        const auto& tile = mRdp->texture_tile[effective_tile[texture]];
++        int shift = horizontal ? tile.shifts : tile.shiftt;
++        if (shift != 0) {
++            coordinate = shift <= 10 ? coordinate / (1 << shift) : coordinate * (1 << (16 - shift));
++        }
++        coordinate -= (horizontal ? tile.uls : tile.ult) / 4.0f;
++        if (!is_rect && (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT) {
++            coordinate += 0.5f;
++        }
++        return coordinate;
++    };
+ 
++    for (const LoadedVertex* vertex : v_arr) {
++        traceGeometry[traceGeometryLength++] = is_rect ? Ship::Math::clamp(vertex->x, -vertex->w, vertex->w) : vertex->x;
++        traceGeometry[traceGeometryLength++] = is_rect ? Ship::Math::clamp(vertex->y, -vertex->w, vertex->w) : vertex->y;
++        traceGeometry[traceGeometryLength++] = vertex->z;
++        traceGeometry[traceGeometryLength++] = vertex->w;
++        traceGeometry[traceGeometryLength++] = textureCoordinate(vertex, 0, true);
++        traceGeometry[traceGeometryLength++] = textureCoordinate(vertex, 0, false);
++        traceGeometry[traceGeometryLength++] = vertex->color.r / 255.0f;
++        traceGeometry[traceGeometryLength++] = vertex->color.g / 255.0f;
++        traceGeometry[traceGeometryLength++] = vertex->color.b / 255.0f;
++        traceGeometry[traceGeometryLength++] = vertex->color.a / 255.0f;
++        traceGeometry[traceGeometryLength++] = textureCoordinate(vertex, 1, true);
++        traceGeometry[traceGeometryLength++] = textureCoordinate(vertex, 1, false);
++        traceGeometry[traceGeometryLength++] = lodFraction;
++    }
++    ReferenceTraceGeometry(this, traceGeometry, traceGeometryLength);
++
++    // LOD colour depends on the triangle's first vertex, so keep its original path.
++    const bool cacheVertices = !is_rect && !state.triangle_lod;
++    float* output = mBufVbo + mBufVboLen;
+     for (int i = 0; i < 3; i++) {
++        const size_t index = v_arr[i] - mRsp->loaded_vertices;
++        if (cacheVertices && mPackedVertexLengths[index] != 0) {
++            const size_t length = mPackedVertexLengths[index];
++            memcpy(output, mPackedVertices[index], length * sizeof(float));
++            output += length;
++            continue;
++        }
++        float* const start = output;
+         float z = v_arr[i]->z, w = v_arr[i]->w;
+         if (clip_parameters.z_is_from_0_to_1) {
+             z = (z + w) / 2.0f;
+         }
+ 
+-        mBufVbo[mBufVboLen++] = v_arr[i]->x;
+-        mBufVbo[mBufVboLen++] = clip_parameters.invertY ? -v_arr[i]->y : v_arr[i]->y;
+-        mBufVbo[mBufVboLen++] = z;
+-        mBufVbo[mBufVboLen++] = w;
++        *output++ = v_arr[i]->x;
++        *output++ = clip_parameters.invertY ? -v_arr[i]->y : v_arr[i]->y;
++        *output++ = z;
++        *output++ = w;
+ 
+         for (int t = 0; t < 2; t++) {
+             if (!usedTextures[t]) {
+@@ -2137,41 +2252,41 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
+                 }
+             }
+ 
+-            mBufVbo[mBufVboLen++] = u / tex_width[t];
+-            mBufVbo[mBufVboLen++] = v / tex_height[t];
++            *output++ = u / tex_width[t];
++            *output++ = v / tex_height[t];
+ 
+             bool clampS = tm & (1 << 2 * t);
+             bool clampT = tm & (1 << 2 * t + 1);
+ 
+             if (clampS) {
+-                mBufVbo[mBufVboLen++] = (tex_width2[t] - 0.5f) / tex_width[t];
++                *output++ = (tex_width2[t] - 0.5f) / tex_width[t];
+             }
+ 
+             if (clampT) {
+-                mBufVbo[mBufVboLen++] = (tex_height2[t] - 0.5f) / tex_height[t];
++                *output++ = (tex_height2[t] - 0.5f) / tex_height[t];
+             }
+         }
+ 
+         if (use_fog) {
+             if (use_blend_color) {
+                 // Shroud/blend mode: blend toward blend_color using fog alpha as factor
+-                mBufVbo[mBufVboLen++] = mRdp->blend_color.r / 255.0f;
+-                mBufVbo[mBufVboLen++] = mRdp->blend_color.g / 255.0f;
+-                mBufVbo[mBufVboLen++] = mRdp->blend_color.b / 255.0f;
+-                mBufVbo[mBufVboLen++] = mRdp->fog_color.a / 255.0f;
++                *output++ = mRdp->blend_color.r / 255.0f;
++                *output++ = mRdp->blend_color.g / 255.0f;
++                *output++ = mRdp->blend_color.b / 255.0f;
++                *output++ = mRdp->fog_color.a / 255.0f;
+             } else {
+-                mBufVbo[mBufVboLen++] = mRdp->fog_color.r / 255.0f;
+-                mBufVbo[mBufVboLen++] = mRdp->fog_color.g / 255.0f;
+-                mBufVbo[mBufVboLen++] = mRdp->fog_color.b / 255.0f;
+-                mBufVbo[mBufVboLen++] = v_arr[i]->color.a / 255.0f; // fog factor (not alpha)
++                *output++ = mRdp->fog_color.r / 255.0f;
++                *output++ = mRdp->fog_color.g / 255.0f;
++                *output++ = mRdp->fog_color.b / 255.0f;
++                *output++ = v_arr[i]->color.a / 255.0f; // fog factor (not alpha)
+             }
+         }
+ 
+         if (use_grayscale) {
+-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.r / 255.0f;
+-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.g / 255.0f;
+-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.b / 255.0f;
+-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.a / 255.0f; // lerp interpolation factor (not alpha)
++            *output++ = mRdp->grayscale_color.r / 255.0f;
++            *output++ = mRdp->grayscale_color.g / 255.0f;
++            *output++ = mRdp->grayscale_color.b / 255.0f;
++            *output++ = mRdp->grayscale_color.a / 255.0f; // lerp interpolation factor (not alpha)
+         }
+ 
+         for (int j = 0; j < numInputs; j++) {
+@@ -2248,28 +2363,37 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
+                         break;
+                 }
+                 if (k == 0) {
+-                    mBufVbo[mBufVboLen++] = color->r / 255.0f;
+-                    mBufVbo[mBufVboLen++] = color->g / 255.0f;
+-                    mBufVbo[mBufVboLen++] = color->b / 255.0f;
++                    *output++ = color->r / 255.0f;
++                    *output++ = color->g / 255.0f;
++                    *output++ = color->b / 255.0f;
+                 } else {
+                     if (use_fog && !use_blend_color && color == &v_arr[i]->color) {
+                         // Shade alpha is 100% for standard fog, blend color mode preserves
+                         // it since fog alpha is the blend factor
+-                        mBufVbo[mBufVboLen++] = 1.0f;
++                        *output++ = 1.0f;
+                     } else {
+-                        mBufVbo[mBufVboLen++] = color->a / 255.0f;
++                        *output++ = color->a / 255.0f;
+                     }
+                 }
+             }
+         }
+ 
++        if (cacheVertices) {
++            const size_t length = output - start;
++            memcpy(mPackedVertices[index], start, length * sizeof(float));
++            mPackedVertexLengths[index] = length;
++        }
++
+         // struct RGBA *color = &v_arr[i]->color;
+-        // mBufVbo[mBufVboLen++] = color->r / 255.0f;
+-        // mBufVbo[mBufVboLen++] = color->g / 255.0f;
+-        // mBufVbo[mBufVboLen++] = color->b / 255.0f;
+-        // mBufVbo[mBufVboLen++] = color->a / 255.0f;
++        // *output++ = color->r / 255.0f;
++        // *output++ = color->g / 255.0f;
++        // *output++ = color->b / 255.0f;
++        // *output++ = color->a / 255.0f;
+     }
+ 
++    mBufVboLen = output - mBufVbo;
++
++    ReferenceTraceTriangle(this, vtx1_idx, vtx2_idx, vtx3_idx, "Drawn");
+     if (++mBufVboNumTris == MAX_TRI_BUFFER) {
+         // if (++mBufVbo_num_tris == 1) {
+         Flush();
+@@ -2454,7 +2578,7 @@ void Interpreter::GfxDpSetScissor(uint32_t mode, uint32_t ulx, uint32_t uly, uin
+ }
+ 
+ void Interpreter::GfxDpSetTextureImage(uint32_t format, uint32_t size, uint32_t width, const char* texPath,
+-                                       uint32_t texFlags, RawTexMetadata rawTexMetdata, const void* addr) {
++                                       uint32_t texFlags, const RawTexMetadata& rawTexMetdata, const void* addr) {
+     // fprintf(stderr, "GfxDpSetTextureImage: %s (width=%d; size=0x%X)\n",
+     //         rawTexMetdata.resource ? rawTexMetdata.resource->GetInitData()->Path.c_str() : nullptr, width, size);
+     mRdp->texture_to_load.addr = (const uint8_t*)addr;
+@@ -3032,6 +3156,7 @@ void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
+         area.height = (uint32_t)h;
+         AdjustVIewportOrScissor(&area);
+ 
++        ReferenceTraceOperation(this, "clear-depth", area.x, area.y, area.width, area.height);
+         mRapi->ClearDepthRegion(area.x, area.y, area.width, area.height);
+         return;
+     }
+@@ -3300,7 +3425,7 @@ void gfx_copy_framebuffer(int fb_dst_id, int fb_src_id, bool copyOnce, bool* has
+ typedef bool (*GfxOpcodeHandlerFunc)(F3DGfx** gfx);
+ 
+ bool gfx_load_ucode_handler_f3dex2(F3DGfx** cmd) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     gfx->mRsp->fog_mul = 0;
+     gfx->mRsp->fog_offset = 0;
+     return false;
+@@ -3312,7 +3437,7 @@ bool gfx_cull_dl_handler_f3dex2(F3DGfx** cmd) {
+ }
+ 
+ bool gfx_marker_handler_otr(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     (*cmd0)++;
+     F3DGfx* cmd = (*cmd0);
+     gfx->mMarkerOn = true;
+@@ -3320,7 +3445,7 @@ bool gfx_marker_handler_otr(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_invalidate_tex_cache_handler_f3dex2(F3DGfx** cmd) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     const uintptr_t texAddr = (*cmd)->words.w1;
+ 
+     if (texAddr == 0) {
+@@ -3349,7 +3474,7 @@ bool gfx_noop_handler_f3dex2(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_mtx_handler_f3dex2(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+     uintptr_t mtxAddr = cmd->words.w1;
+ 
+@@ -3358,7 +3483,7 @@ bool gfx_mtx_handler_f3dex2(F3DGfx** cmd0) {
+ }
+ // Seems to be the same for all other non F3DEX2 microcodes...
+ bool gfx_mtx_handler_f3d(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+     uintptr_t mtxAddr = cmd->words.w1;
+ 
+@@ -3367,7 +3492,7 @@ bool gfx_mtx_handler_f3d(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_mtx_otr_filepath_handler_custom_f3dex2(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+     const char* fileName = (const char*)cmd->words.w1;
+     const int32_t* mtx = (const int32_t*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(
+@@ -3381,7 +3506,7 @@ bool gfx_mtx_otr_filepath_handler_custom_f3dex2(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_mtx_otr_filepath_handler_custom_f3d(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+     const char* fileName = (const char*)cmd->words.w1;
+     const int32_t* mtx = (const int32_t*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(
+@@ -3411,7 +3536,7 @@ bool gfx_mtx_otr_handler_custom_f3dex2(F3DGfx** cmd0) {
+         (const int32_t*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(hash);
+ 
+     if (mtx != NULL) {
+-        Interpreter* gfx = mInstance.lock().get();
++        Interpreter* gfx = mInstance.get();
+         cmd--;
+         gfx->GfxSpMatrix(C0(0, 8) ^ F3DEX2_G_MTX_PUSH, mtx);
+         cmd++;
+@@ -3421,7 +3546,7 @@ bool gfx_mtx_otr_handler_custom_f3dex2(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_mtx_otr_handler_custom_f3d(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     (*cmd0)++;
+     F3DGfx* cmd = *cmd0;
+ 
+@@ -3445,7 +3570,7 @@ bool gfx_mtx_otr_handler_custom(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_pop_mtx_handler_f3dex2(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpPopMatrix((uint32_t)(cmd->words.w1 / 64));
+@@ -3454,7 +3579,7 @@ bool gfx_pop_mtx_handler_f3dex2(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_pop_mtx_handler_f3d(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpPopMatrix(1);
+@@ -3463,7 +3588,7 @@ bool gfx_pop_mtx_handler_f3d(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_movemem_handler_f3dex2(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpMovememF3dex2(C0(0, 8), C0(8, 8) * 8, gfx->SegAddr(cmd->words.w1));
+@@ -3472,7 +3597,7 @@ bool gfx_movemem_handler_f3dex2(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_movemem_handler_f3d(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpMovememF3d(C0(16, 8), 0, gfx->SegAddr(cmd->words.w1));
+@@ -3481,7 +3606,7 @@ bool gfx_movemem_handler_f3d(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_movemem_handler_otr(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     const uint8_t index = C1(24, 8);
+@@ -3505,7 +3630,7 @@ bool gfx_movemem_handler_otr(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_push_shader(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+     const char* path = (const char*)gfx->SegAddr(cmd->words.w1);
+ 
+@@ -3535,7 +3660,7 @@ bool gfx_push_shader(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_pop_shader(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->mShaderStack.pop();
+@@ -3544,7 +3669,7 @@ bool gfx_pop_shader(F3DGfx** cmd0) {
+ }
+ 
+ const char* gfx_get_shader(int16_t id) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+ 
+     for (const std::pair<size_t, const char*>& shader : gfx->mShaders) {
+         if (shader.first == id) {
+@@ -3556,7 +3681,7 @@ const char* gfx_get_shader(int16_t id) {
+ }
+ 
+ bool gfx_moveword_handler_f3dex2(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpMovewordF3dex2(C0(16, 8), C0(0, 16), cmd->words.w1);
+@@ -3565,7 +3690,7 @@ bool gfx_moveword_handler_f3dex2(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_moveword_handler_f3d(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpMovewordF3d(C0(0, 8), C0(8, 16), cmd->words.w1);
+@@ -3574,7 +3699,7 @@ bool gfx_moveword_handler_f3d(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_texture_handler_f3dex2(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpTexture(C1(16, 16), C1(0, 16), C0(11, 3), C0(8, 3), C0(1, 7));
+@@ -3584,7 +3709,7 @@ bool gfx_texture_handler_f3dex2(F3DGfx** cmd0) {
+ 
+ // Seems to be the same for all other non F3DEX2 microcodes...
+ bool gfx_texture_handler_f3d(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpTexture(C1(16, 16), C1(0, 16), C0(11, 3), C0(8, 3), C0(0, 8));
+@@ -3594,7 +3719,7 @@ bool gfx_texture_handler_f3d(F3DGfx** cmd0) {
+ 
+ // Almost all versions of the microcode have their own version of this opcode
+ bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpVertex(C0(12, 8), C0(1, 7) - C0(12, 8), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+@@ -3603,7 +3728,7 @@ bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_vtx_handler_f3dex(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+     gfx->GfxSpVertex(C0(10, 6), C0(17, 7), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+ 
+@@ -3611,7 +3736,7 @@ bool gfx_vtx_handler_f3dex(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_vtx_handler_f3d(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpVertex((C0(0, 16)) / sizeof(F3DVtx), C0(16, 4), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+@@ -3620,7 +3745,7 @@ bool gfx_vtx_handler_f3d(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_vtx_hash_handler_custom(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     // Offset added to the start of the vertices
+     const uintptr_t offset = (*cmd0)->words.w1;
+     // This is a two-part display list command, so increment the instruction pointer so we can get the CRC64
+@@ -3655,7 +3780,7 @@ bool gfx_vtx_hash_handler_custom(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_vtx_otr_filepath_handler_custom(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+     char* fileName = (char*)cmd->words.w1;
+     (*cmd0)++;
+@@ -3696,7 +3821,7 @@ bool gfx_dl_otr_filepath_handler_custom(F3DGfx** cmd0) {
+ 
+ // The original F3D microcode doesn't seem to have this opcode. Glide handles it as part of moveword
+ bool gfx_modify_vtx_handler_f3dex2(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+     gfx->GfxSpModifyVertex(C0(1, 15), C0(16, 8), (uint32_t)cmd->words.w1);
+     return false;
+@@ -3704,7 +3829,7 @@ bool gfx_modify_vtx_handler_f3dex2(F3DGfx** cmd0) {
+ 
+ // F3D, F3DEX, and F3DEX2 do the same thing but F3DEX2 has its own opcode number
+ bool gfx_dl_handler_common(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
+     if (C0(16, 1) == 0) {
+@@ -3734,7 +3859,7 @@ bool gfx_dl_otr_hash_handler_custom(F3DGfx** cmd0) {
+             g_exec_stack.call(cmd, gfx);
+         }
+     } else {
+-        Interpreter* gfx = mInstance.lock().get();
++        Interpreter* gfx = mInstance.get();
+         assert(0 && "????");
+         (*cmd0) = (F3DGfx*)gfx->SegAddr((*cmd0)->words.w1);
+         return true;
+@@ -3745,7 +3870,7 @@ bool gfx_dl_index_handler(F3DGfx** cmd0) {
+     // Compute seg addr by converting an index value to a offset value
+     // handling 32 vs 64 bit size differences for Gfx
+     // adding 1 to trigger the segaddr flow
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = (*cmd0);
+     uint8_t segNum = (uint8_t)(cmd->words.w1 >> 24);
+     uint32_t index = (uint32_t)(cmd->words.w1 & 0x00FFFFFF);
+@@ -3774,7 +3899,7 @@ bool gfx_pushcd_handler_custom(F3DGfx** cmd0) {
+ // TODO handle special OTR opcodes later...
+ bool gfx_branch_z_otr_handler_f3dex2(F3DGfx** cmd0) {
+     // Push return address
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = (*cmd0);
+ 
+     uint8_t vbidx = (uint8_t)((*cmd0)->words.w0 & 0x00000FFF);
+@@ -3799,14 +3924,14 @@ bool gfx_branch_z_otr_handler_f3dex2(F3DGfx** cmd0) {
+ 
+ // F3D, F3DEX, and F3DEX2 do the same thing but F3DEX2 has its own opcode number
+ bool gfx_end_dl_handler_common(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     gfx->mMarkerOn = false;
+     g_exec_stack.ret();
+     return true;
+ }
+ 
+ bool gfx_set_prim_depth_handler_rdp(F3DGfx** cmd) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     uint32_t w1 = (*cmd)->words.w1;
+     gfx->mRdp->prim_depth = (uint16_t)((w1 >> 16) & 0x7FFF); // Mask to 15 bits
+     return false;
+@@ -3814,7 +3939,7 @@ bool gfx_set_prim_depth_handler_rdp(F3DGfx** cmd) {
+ 
+ // Only on F3DEX2
+ bool gfx_geometry_mode_handler_f3dex2(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpGeometryMode(~C0(0, 24), (uint32_t)cmd->words.w1);
+@@ -3823,7 +3948,7 @@ bool gfx_geometry_mode_handler_f3dex2(F3DGfx** cmd0) {
+ 
+ // Only on F3DEX and older
+ bool gfx_set_geometry_mode_handler_f3d(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpGeometryMode(0, (uint32_t)cmd->words.w1);
+@@ -3832,7 +3957,7 @@ bool gfx_set_geometry_mode_handler_f3d(F3DGfx** cmd0) {
+ 
+ // Only on F3DEX and older
+ bool gfx_clear_geometry_mode_handler_f3d(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpGeometryMode((uint32_t)cmd->words.w1, 0);
+@@ -3840,7 +3965,7 @@ bool gfx_clear_geometry_mode_handler_f3d(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_tri1_otr_handler_f3dex2(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+ 
+     F3DGfx* cmd = *cmd0;
+     uint8_t v00 = (uint8_t)(cmd->words.w0 & 0x0000FFFF);
+@@ -3852,7 +3977,7 @@ bool gfx_tri1_otr_handler_f3dex2(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_tri1_handler_f3dex2(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpTri1(C0(16, 8) / 2, C0(8, 8) / 2, C0(0, 8) / 2, false);
+@@ -3861,7 +3986,7 @@ bool gfx_tri1_handler_f3dex2(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_tri1_handler_f3dex(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpTri1(C1(17, 7), C1(9, 7), C1(1, 7), false);
+@@ -3870,7 +3995,7 @@ bool gfx_tri1_handler_f3dex(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_tri1_handler_f3d(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpTri1(C1(16, 8) / 10, C1(8, 8) / 10, C1(0, 8) / 10, false);
+@@ -3880,7 +4005,7 @@ bool gfx_tri1_handler_f3d(F3DGfx** cmd0) {
+ 
+ // F3DEX, and F3DEX2 share a tri2 function, however F3DEX has a different quad function.
+ bool gfx_tri2_handler_f3dex(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpTri1(C0(17, 7), C0(9, 7), C0(1, 7), false);
+@@ -3889,7 +4014,7 @@ bool gfx_tri2_handler_f3dex(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_quad_handler_f3dex2(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpTri1(C0(16, 8) / 2, C0(8, 8) / 2, C0(0, 8) / 2, false);
+@@ -3898,7 +4023,7 @@ bool gfx_quad_handler_f3dex2(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_quad_handler_f3dex(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpTri1(C1(16, 8) / 2, C1(8, 8) / 2, C1(0, 8) / 2, false);
+@@ -3907,7 +4032,7 @@ bool gfx_quad_handler_f3dex(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_othermode_l_handler_f3dex2(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpSetOtherMode(31 - C0(8, 8) - C0(0, 8), C0(0, 8) + 1, cmd->words.w1);
+@@ -3916,7 +4041,7 @@ bool gfx_othermode_l_handler_f3dex2(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_othermode_l_handler_f3d(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpSetOtherMode(C0(8, 8), C0(0, 8), cmd->words.w1);
+@@ -3925,7 +4050,7 @@ bool gfx_othermode_l_handler_f3d(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_othermode_h_handler_f3dex2(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpSetOtherMode(63 - C0(8, 8) - C0(0, 8), C0(0, 8) + 1, (uint64_t)cmd->words.w1 << 32);
+@@ -3935,7 +4060,7 @@ bool gfx_othermode_h_handler_f3dex2(F3DGfx** cmd0) {
+ 
+ // Only on F3DEX and older
+ bool gfx_set_geometry_mode_handler_f3dex(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpGeometryMode(0, (uint32_t)cmd->words.w1);
+@@ -3944,7 +4069,7 @@ bool gfx_set_geometry_mode_handler_f3dex(F3DGfx** cmd0) {
+ 
+ // Only on F3DEX and older
+ bool gfx_clear_geometry_mode_handler_f3dex(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpGeometryMode((uint32_t)cmd->words.w1, 0);
+@@ -3952,7 +4077,7 @@ bool gfx_clear_geometry_mode_handler_f3dex(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_othermode_h_handler_f3d(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxSpSetOtherMode(C0(8, 8) + 32, C0(0, 8), (uint64_t)cmd->words.w1 << 32);
+@@ -3964,6 +4089,9 @@ bool gfx_othermode_h_handler_f3d(F3DGfx** cmd0) {
+ // failed to resolve it (segment not set up). Keep it only if it belongs to a loaded module,
+ // where it's a real low pointer (e.g. a static TLUT) rather than an unresolved segment addr.
+ static bool IsValidResolvedAddress(uintptr_t addr) {
++#ifdef __wasm__
++    return addr >= 1024 && addr < __builtin_wasm_memory_size(0) * 65536u;
++#else
+     if (addr > 0x0FFFFFFF) {
+         return true;
+     }
+@@ -3979,10 +4107,11 @@ static bool IsValidResolvedAddress(uintptr_t addr) {
+     Dl_info info;
+     return dladdr(reinterpret_cast<void*>(addr), &info) != 0;
+ #endif
++#endif
+ }
+ 
+ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+     uintptr_t i = (uintptr_t)gfx->SegAddr(cmd->words.w1);
+ 
+@@ -4029,19 +4158,11 @@ bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
+     (*cmd0)++;
+     uint64_t hash = ((uint64_t)(*cmd0)->words.w0 << 32) + (uint64_t)(*cmd0)->words.w1;
+ 
+-    const char* fileName =
+-        Ship::Context::GetRawInstance()->GetResourceManager()->GetArchiveManager()->HashToCString(hash);
+     uint32_t texFlags = 0;
+     RawTexMetadata rawTexMetadata = {};
+ 
+-    if (fileName == nullptr) {
+-        (*cmd0)++;
+-        return false;
+-    }
+-
+     std::shared_ptr<Fast::Texture> texture = std::static_pointer_cast<Fast::Texture>(
+-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess(
+-            Ship::Context::GetRawInstance()->GetResourceManager()->GetArchiveManager()->HashToCString(hash)));
++        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess(hash));
+     if (texture != nullptr) {
+         texFlags = texture->Flags;
+         rawTexMetadata.width = texture->Width;
+@@ -4077,8 +4198,8 @@ bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
+         uint32_t width = C0(0, 12) + 1;
+ 
+         if (tex != NULL) {
+-            Interpreter* gfx = mInstance.lock().get();
+-            gfx->GfxDpSetTextureImage(fmt, size, width, fileName, texFlags, rawTexMetadata, tex);
++            Interpreter* gfx = mInstance.get();
++            gfx->GfxDpSetTextureImage(fmt, size, width, nullptr, texFlags, rawTexMetadata, tex);
+         }
+     } else {
+         SPDLOG_ERROR("G_SETTIMG_OTR_HASH: Texture is null");
+@@ -4098,7 +4219,7 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
+     std::shared_ptr<Fast::Texture> texture = std::static_pointer_cast<Fast::Texture>(
+         Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess(fileName));
+     if (texture != nullptr) {
+-        Interpreter* gfx = mInstance.lock().get();
++        Interpreter* gfx = mInstance.get();
+         texFlags = texture->Flags;
+         rawTexMetadata.width = texture->Width;
+         rawTexMetadata.height = texture->Height;
+@@ -4121,7 +4242,7 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
+ 
+ bool gfx_set_fb_handler_custom(F3DGfx** cmd0) {
+     F3DGfx* cmd = *cmd0;
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     gfx->Flush();
+ 
+     if (cmd->words.w1) {
+@@ -4137,7 +4258,7 @@ bool gfx_set_fb_handler_custom(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_reset_fb_handler_custom(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     gfx->Flush();
+     gfx->mFbActive = false;
+     gfx->mActiveFrameBuffer = gfx->mFrameBuffers.end();
+@@ -4152,7 +4273,7 @@ bool gfx_reset_fb_handler_custom(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_copy_fb_handler_custom(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+     bool* hasCopiedPtr = (bool*)cmd->words.w1;
+ 
+@@ -4162,7 +4283,7 @@ bool gfx_copy_fb_handler_custom(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_read_fb_handler_custom(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     int32_t width, height;
+@@ -4179,6 +4300,7 @@ bool gfx_read_fb_handler_custom(F3DGfx** cmd0) {
+     height = C1(16, 16);
+ 
+     gfx->Flush();
++    ReferenceTraceOperation(gfx, "read-target", fbId, width, height, bswap ? 1 : 0);
+     gfx->mRapi->ReadFramebufferToCPU(fbId, width, height, rgba16Buffer);
+ 
+ #ifndef IS_BIGENDIAN
+@@ -4194,7 +4316,7 @@ bool gfx_read_fb_handler_custom(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_register_blended_texture_handler_custom(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     // Flush incase we are replacing a previous blended texture that hasn't been finialized to the GPU
+@@ -4225,7 +4347,7 @@ bool gfx_register_blended_texture_handler_custom(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_set_timg_fb_handler_custom(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->Flush();
+@@ -4236,7 +4358,7 @@ bool gfx_set_timg_fb_handler_custom(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_set_grayscale_handler_custom(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->mRdp->grayscale = cmd->words.w1;
+@@ -4244,7 +4366,7 @@ bool gfx_set_grayscale_handler_custom(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_load_block_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxDpLoadBlock(C1(24, 3), C0(12, 12), C0(0, 12), C1(12, 12), C1(0, 12));
+@@ -4252,7 +4374,7 @@ bool gfx_load_block_handler_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_load_block_wide_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     uint32_t tile = cmd->words.w0 & 0x7;
+@@ -4270,7 +4392,7 @@ bool gfx_load_block_wide_handler_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_load_tile_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxDpLoadTile(C1(24, 3), C0(12, 12), C0(0, 12), C1(12, 12), C1(0, 12));
+@@ -4278,7 +4400,7 @@ bool gfx_load_tile_handler_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_set_tile_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxDpSetTile(C0(21, 3), C0(19, 2), C0(9, 9), C0(0, 9), C1(24, 3), C1(20, 4), C1(18, 2), C1(14, 4), C1(10, 4),
+@@ -4287,7 +4409,7 @@ bool gfx_set_tile_handler_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_set_tile_size_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxDpSetTileSize(C1(24, 3), C0(12, 12), C0(0, 12), C1(12, 12), C1(0, 12));
+@@ -4296,7 +4418,7 @@ bool gfx_set_tile_size_handler_rdp(F3DGfx** cmd0) {
+ 
+ bool gfx_set_tile_size_interp_handler_rdp(F3DGfx** cmd0) {
+     F3DGfx* cmd = *cmd0;
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+ 
+     if (gfx->mInterpolationIndex == gfx->mInterpolationIndexTarget) {
+         int tile = C1(24, 3);
+@@ -4317,7 +4439,7 @@ bool gfx_set_tile_size_interp_handler_rdp(F3DGfx** cmd0) {
+ 
+ bool gfx_set_tile_size_lerp_handler_rdp(F3DGfx** cmd0) {
+     F3DGfx* cmd = *cmd0;
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+ 
+     int tile = C1(24, 3);
+     float coords[8];
+@@ -4340,14 +4462,14 @@ bool gfx_set_tile_size_lerp_handler_rdp(F3DGfx** cmd0) {
+ 
+ bool gfx_set_interpolation_index_target(F3DGfx** cmd0) {
+     F3DGfx* cmd = *cmd0;
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+ 
+     gfx->mInterpolationIndexTarget = cmd->words.w1;
+     return false;
+ }
+ 
+ bool gfx_load_tlut_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxDpLoadTlut(C1(24, 3), C1(14, 10));
+@@ -4355,7 +4477,7 @@ bool gfx_load_tlut_handler_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_set_env_color_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxDpSetEnvColor(C1(24, 8), C1(16, 8), C1(8, 8), C1(0, 8));
+@@ -4363,7 +4485,7 @@ bool gfx_set_env_color_handler_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_set_prim_color_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxDpSetPrimColor(C0(8, 8), C0(0, 8), C1(24, 8), C1(16, 8), C1(8, 8), C1(0, 8));
+@@ -4371,7 +4493,7 @@ bool gfx_set_prim_color_handler_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_set_fog_color_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxDpSetFogColor(C1(24, 8), C1(16, 8), C1(8, 8), C1(0, 8));
+@@ -4384,7 +4506,7 @@ bool gfx_set_fog_color_handler_rdp(F3DGfx** cmd0) {
+ // applied during texture sampling.
+ // G_SETKEYR: w1 = [wR:12 | cR:8 | sR:8]
+ bool gfx_set_key_r_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->mRdp->key_center.r = C1(8, 8);
+@@ -4394,7 +4516,7 @@ bool gfx_set_key_r_handler_rdp(F3DGfx** cmd0) {
+ 
+ // G_SETKEYGB: w0 = [op:8 | wG:12 | _:4 | wB:12], w1 = [cG:8 | sG:8 | cB:8 | sB:8]
+ bool gfx_set_key_gb_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->mRdp->key_center.g = C1(24, 8);
+@@ -4407,7 +4529,7 @@ bool gfx_set_key_gb_handler_rdp(F3DGfx** cmd0) {
+ // G_SETCONVERT: w0 = [op:8 | k0:9 | k1:9 | k2_hi:4], w1 = [k2_lo:5 | k3:9 | k4:9 | k5:9]
+ // K0..K5 are signed 9-bit values; sign-extend after decoding.
+ bool gfx_set_convert_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->mRdp->convert_k[0] = sign_extend_9(C0(13, 9));
+@@ -4421,7 +4543,7 @@ bool gfx_set_convert_handler_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_set_blend_color_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxDpSetBlendColor(C1(24, 8), C1(16, 8), C1(8, 8), C1(0, 8));
+@@ -4429,7 +4551,7 @@ bool gfx_set_blend_color_handler_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_set_fill_color_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxDpSetFillColor((uint32_t)cmd->words.w1);
+@@ -4437,7 +4559,7 @@ bool gfx_set_fill_color_handler_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_set_intensity_handler_custom(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxDpSetGrayscaleColor(C1(24, 8), C1(16, 8), C1(8, 8), C1(0, 8));
+@@ -4445,7 +4567,7 @@ bool gfx_set_intensity_handler_custom(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_set_combine_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+ 
+     gfx->GfxDpSetCombineMode(
+@@ -4455,7 +4577,7 @@ bool gfx_set_combine_handler_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_tex_rect_and_flip_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
+     int32_t lrx, lry, tile, ulx, uly;
+@@ -4481,7 +4603,7 @@ bool gfx_tex_rect_and_flip_handler_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_tex_rect_wide_handler_custom(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
+     int32_t lrx, lry, tile, ulx, uly;
+@@ -4505,7 +4627,7 @@ bool gfx_tex_rect_wide_handler_custom(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_image_rect_handler_custom(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *cmd0;
+     int16_t tile, iw, ih;
+     int16_t x0, y0, s0, t0;
+@@ -4529,7 +4651,7 @@ bool gfx_image_rect_handler_custom(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_fill_rect_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *(cmd0);
+ 
+     gfx->GfxDpFillRectangle(C1(12, 12), C1(0, 12), C0(12, 12), C0(0, 12));
+@@ -4537,7 +4659,7 @@ bool gfx_fill_rect_handler_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_fill_wide_rect_handler_custom(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *(cmd0);
+     int32_t lrx, lry, ulx, uly;
+ 
+@@ -4552,7 +4674,7 @@ bool gfx_fill_wide_rect_handler_custom(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_SetScissor_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *(cmd0);
+ 
+     gfx->GfxDpSetScissor(C1(24, 2), C0(12, 12), C0(0, 12), C1(12, 12), C1(0, 12));
+@@ -4560,7 +4682,7 @@ bool gfx_SetScissor_handler_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_set_z_img_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *(cmd0);
+ 
+     gfx->GfxDpSetZImage(gfx->SegAddr(cmd->words.w1));
+@@ -4568,7 +4690,7 @@ bool gfx_set_z_img_handler_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_set_c_img_handler_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *(cmd0);
+ 
+     gfx->GfxDpSetColorImage(C0(21, 3), C0(19, 2), C0(0, 11), gfx->SegAddr(cmd->words.w1));
+@@ -4576,7 +4698,7 @@ bool gfx_set_c_img_handler_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_rdp_set_other_mode_rdp(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *(cmd0);
+ 
+     gfx->GfxDpSetOtherMode(C0(0, 24), (uint32_t)cmd->words.w1);
+@@ -4584,7 +4706,7 @@ bool gfx_rdp_set_other_mode_rdp(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_bg_copy_handler_s2dex(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *(cmd0);
+ 
+     if (!gfx->mMarkerOn) {
+@@ -4594,7 +4716,7 @@ bool gfx_bg_copy_handler_s2dex(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_bg_1cyc_handler_s2dex(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *(cmd0);
+ 
+     gfx->Gfxs2dexBg1cyc((F3DuObjBg*)cmd->words.w1);
+@@ -4602,7 +4724,7 @@ bool gfx_bg_1cyc_handler_s2dex(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_obj_rectangle_handler_s2dex(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *(cmd0);
+ 
+     if (!gfx->mMarkerOn) {
+@@ -4612,7 +4734,7 @@ bool gfx_obj_rectangle_handler_s2dex(F3DGfx** cmd0) {
+ }
+ 
+ bool gfx_extra_geometry_mode_handler_custom(F3DGfx** cmd0) {
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     F3DGfx* cmd = *(cmd0);
+ 
+     gfx->GfxSpExtraGeometryMode(~C0(0, 24), (uint32_t)cmd->words.w1);
+@@ -4842,7 +4964,7 @@ const char* GfxGetOpcodeName(int8_t opcode) {
+ static void gfx_set_ucode_handler(UcodeHandlers ucode) {
+     // Loaded ucode must be in range of the supported ucode_handlers
+     assert(ucode < ucode_max);
+-    Interpreter* gfx = mInstance.lock().get();
++    Interpreter* gfx = mInstance.get();
+     ucode_handler_index = ucode;
+ 
+     // Reset some RSP state values upon ucode load to deal with hardware quirks discovered by emulators
+@@ -4864,6 +4986,20 @@ static void gfx_step() {
+     auto& cmd = g_exec_stack.currCmd();
+     auto cmd0 = cmd;
+     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
++    Interpreter* traceInterpreter = mInstance.get();
++    if (ucode_handler_index != ucode_f3dex2 ||
++        (opcode != F3DEX2_G_TRI1 && opcode != F3DEX2_G_TRI2 && opcode != F3DEX2_G_QUAD &&
++         opcode != OTR_G_TRI1_OTR)) {
++        traceInterpreter->mTriangleState.valid = false;
++    }
++    ReferenceTraceCommand(traceInterpreter, cmd, static_cast<uint32_t>(ucode_handler_index),
++                          g_exec_stack.cmd_stack.size());
++    struct TraceStateAtCommandEnd {
++        Interpreter* interpreter;
++        ~TraceStateAtCommandEnd() {
++            ReferenceTraceState(interpreter);
++        }
++    } traceStateAtCommandEnd{ traceInterpreter };
+ 
+ #ifdef USE_GBI_TRACE
+     if (cmd->words.trace.valid &&
+@@ -4901,6 +5037,7 @@ static void gfx_step() {
+                 ++g_exec_stack.currCmd();
+                 return;
+             }
++            ReferenceTraceResource(traceInterpreter, static_cast<uint8_t>(opcode), reinterpret_cast<const char*>(w1));
+         }
+         if (otrHandlers.at(opcode).second(&cmd)) {
+             return;
+@@ -4915,8 +5052,9 @@ static void gfx_step() {
+                 return;
+             }
+         } else {
+-            SPDLOG_CRITICAL("Unhandled OP code: 0x{:X}, for loaded ucode: {}", (uint8_t)opcode,
+-                            (uint32_t)ucode_handler_index);
++            fprintf(stderr, "Unhandled opcode %02x at %p: %08x %08x, ucode %u\n", (uint8_t)opcode,
++                    (void*)cmd, (uint32_t)cmd->words.w0, (uint32_t)cmd->words.w1, (uint32_t)ucode_handler_index);
++            abort();
+         }
+     } else {
+         SPDLOG_CRITICAL("Unhandled OP code: 0x{:X}, invalid ucode: {}", (uint8_t)opcode, (uint32_t)ucode_handler_index);
+@@ -4926,6 +5064,7 @@ static void gfx_step() {
+ }
+ 
+ void Interpreter::SpReset() {
++    mTriangleState.valid = false;
+     while (!mShaderStack.empty()) {
+         mShaderStack.pop();
+     }
+@@ -5130,6 +5269,7 @@ void Interpreter::RunGuiOnly() {
+ 
+ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
+     SpReset();
++    ReferenceTraceBeginRun(this);
+ 
+     mGetPixelDepthPending.clear();
+     mGetPixelDepthCached.clear();
+@@ -5146,11 +5286,12 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
+     mRenderingState.scissor = {};
+ 
+     auto dbg = mGfxDebugger;
++    const bool debugging = dbg->IsDebugging();
+     g_exec_stack.start((F3DGfx*)commands);
+     while (!g_exec_stack.cmd_stack.empty()) {
+         auto cmd = g_exec_stack.cmd_stack.top();
+ 
+-        if (dbg->IsDebugging()) {
++        if (debugging) {
+             g_exec_stack.gfx_path.push_back(cmd);
+             if (dbg->HasBreakPoint(g_exec_stack.gfx_path)) {
+                 // On a breakpoint with the active framebuffer still set, we need to reset back to prevent
+@@ -5191,6 +5332,12 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
+ 
+         assert(0 && "active framebuffer was never reset back to original");
+     }
++    int referenceFrameBuffer = mRendersToFb ? mGameFb : 0;
++    if (mRendersToFb && mMsaaLevel > 1 && !ViewportMatchesRendererResolution()) {
++        referenceFrameBuffer = mGameFbMsaaResolved;
++    }
++    ReferenceTraceFramebuffers(mRapi, referenceFrameBuffer, mCurDimensions.width, mCurDimensions.height);
++    ReferenceTraceEndRun(this);
+ }
+ 
+ void Interpreter::EndFrame() {
+@@ -5233,8 +5380,10 @@ int Interpreter::CreateFrameBuffer(uint32_t width, uint32_t height, uint32_t nat
+ }
+ 
+ void Interpreter::SetFrameBuffer(int fb, float noiseScale) {
++    ReferenceTraceOperation(this, "set-target", fb);
+     mRapi->StartDrawToFramebuffer(fb, noiseScale);
+     mRapi->ClearFramebuffer(false, true);
++    ReferenceTraceOperation(this, "clear-target", fb, 0, 1);
+ }
+ 
+ void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, bool* hasCopiedPtr) {
+@@ -5248,6 +5397,8 @@ void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, b
+         fb_src_id = mGameFb;
+     }
+ 
++    ReferenceTraceOperation(this, "copy-target", fb_src_id, fb_dst_id, copyOnce ? 1 : 0);
++
+     int srcX0, srcY0, srcX1, srcY1;
+     int dstX0, dstY0, dstX1, dstY1;
+ 
+@@ -5280,6 +5431,7 @@ void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, b
+ }
+ 
+ void Interpreter::ResetFrameBuffer() {
++    ReferenceTraceOperation(this, "set-target", 0);
+     mRapi->StartDrawToFramebuffer(0, (float)mCurDimensions.height / mNativeDimensions.height);
+ }
+ 
+@@ -5477,26 +5629,26 @@ void gfx_cc_get_features(uint64_t shader_id0, uint64_t shader_id1, struct CCFeat
+ 
+ extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,
+                                       uint8_t resize, bool forceFixedAspect) {
+-    return Fast::mInstance.lock().get()->CreateFrameBuffer(width, height, native_width, native_height, resize,
++    return Fast::mInstance.get()->CreateFrameBuffer(width, height, native_width, native_height, resize,
+                                                            forceFixedAspect);
+ }
+ 
+ extern "C" void gfx_texture_cache_clear() {
+-    Fast::mInstance.lock().get()->TextureCacheClear();
++    Fast::mInstance.get()->TextureCacheClear();
+ }
+ 
+ extern "C" void gfx_shader_cache_clear() {
+-    auto instance = Fast::mInstance.lock().get();
++    auto instance = Fast::mInstance.get();
+     instance->mColorCombinerPool.clear();
+-    instance->mPrevCombiner = Fast::mInstance.lock().get()->mColorCombinerPool.end();
++    instance->mPrevCombiner = Fast::mInstance.get()->mColorCombinerPool.end();
+     instance->mRenderingState.mShaderProgram = nullptr;
+     instance->mRapi->ClearShaderCache();
+ }
+ 
+ extern "C" void gfx_register_fb_texture(const void* cpuAddr, int fbId) {
+-    Fast::mInstance.lock().get()->RegisterFbTexture(cpuAddr, fbId);
++    Fast::mInstance.get()->RegisterFbTexture(cpuAddr, fbId);
+ }
+ 
+ extern "C" void gfx_unregister_fb_texture(const void* cpuAddr) {
+-    Fast::mInstance.lock().get()->UnregisterFbTexture(cpuAddr);
+-}
+\ No newline at end of file
++    Fast::mInstance.get()->UnregisterFbTexture(cpuAddr);
++}
+diff --git a/libultraship/src/fast/reference_trace.cpp b/libultraship/src/fast/reference_trace.cpp
+new file mode 100644
+index 0000000..98b5e1d
+--- /dev/null
++++ b/libultraship/src/fast/reference_trace.cpp
+@@ -0,0 +1,313 @@
++#include "fast/reference_trace.h"
++
++#include <algorithm>
++#include <bit>
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include "fast/backends/gfx_rendering_api.h"
++#include "fast/interpreter.h"
++
++namespace Fast {
++namespace {
++
++constexpr size_t DefaultMaximumEvents = 500000;
++
++uint32_t PackColor(const RGBA& color) {
++    return (static_cast<uint32_t>(color.r) << 24) | (static_cast<uint32_t>(color.g) << 16) |
++           (static_cast<uint32_t>(color.b) << 8) | color.a;
++}
++
++long ReadLong(const char* name, long fallback) {
++    const char* value = std::getenv(name);
++    if (value == nullptr || *value == '\0') {
++        return fallback;
++    }
++    char* end = nullptr;
++    errno = 0;
++    long parsed = std::strtol(value, &end, 10);
++    return errno == 0 && end != value && *end == '\0' ? parsed : fallback;
++}
++
++class Writer {
++  public:
++    Writer() {
++        const char* path = std::getenv("OOT_FAST3D_TRACE");
++        if (path == nullptr || *path == '\0') {
++            return;
++        }
++        mFile = std::fopen(path, "wb");
++        if (mFile == nullptr) {
++            std::fprintf(stderr, "Unable to open OOT_FAST3D_TRACE '%s': %s\n", path, std::strerror(errno));
++            return;
++        }
++        mFirstFrame = std::max(0L, ReadLong("OOT_FAST3D_TRACE_FRAME", 0));
++        mFrameCount = std::max(1L, ReadLong("OOT_FAST3D_TRACE_FRAMES", 1));
++        mMaximumEvents = static_cast<size_t>(std::max(1L, ReadLong("OOT_FAST3D_TRACE_MAX_EVENTS", DefaultMaximumEvents)));
++        mExitWhenComplete = ReadLong("OOT_FAST3D_CAPTURE_EXIT", 0) != 0;
++        const char* colorPath = std::getenv("OOT_FAST3D_COLOR_CAPTURE");
++        if (colorPath != nullptr) {
++            mColorPath = colorPath;
++        }
++        const char* depthPath = std::getenv("OOT_FAST3D_DEPTH_CAPTURE");
++        if (depthPath != nullptr) {
++            mDepthPath = depthPath;
++        }
++    }
++
++    ~Writer() {
++        if (mFile != nullptr) {
++            std::fclose(mFile);
++        }
++    }
++
++    bool active() const {
++        return mActive && !mOverflowed;
++    }
++
++    int commandIndex() const {
++        return mCommandIndex;
++    }
++
++    void beginRun(float interpolation, int interpolationIndex) {
++        mActive = mFile != nullptr && mRunIndex >= mFirstFrame && mRunIndex < mFirstFrame + mFrameCount;
++        mCommandIndex = -1;
++        mEvents = 0;
++        mOverflowed = false;
++        if (mActive) {
++            line("fast3d-reference-trace|1|%ld|%08x|%d\n", mRunIndex, std::bit_cast<uint32_t>(interpolation),
++                 interpolationIndex);
++        }
++    }
++
++    void endRun() {
++        const bool completedCapture = mActive && mRunIndex + 1 >= mFirstFrame + mFrameCount;
++        if (mActive && mFile != nullptr) {
++            std::fprintf(mFile, "end|%ld|%zu|%d\n", mRunIndex, mEvents, mOverflowed ? 1 : 0);
++            std::fflush(mFile);
++        }
++        mActive = false;
++        ++mRunIndex;
++        if (completedCapture && mExitWhenComplete) {
++            std::_Exit(EXIT_SUCCESS);
++        }
++    }
++
++    bool beginEvent() {
++        if (!active() || mFile == nullptr) {
++            return false;
++        }
++        if (mEvents++ >= mMaximumEvents) {
++            mOverflowed = true;
++            std::fprintf(mFile, "overflow|%ld|%zu\n", mRunIndex, mEvents - 1);
++            return false;
++        }
++        return true;
++    }
++
++    template <typename... Args> void line(const char* format, Args... args) {
++        if (!beginEvent()) {
++            return;
++        }
++        std::fprintf(mFile, format, args...);
++    }
++
++    template <typename... Args> void raw(const char* format, Args... args) {
++        if (!active() || mFile == nullptr) {
++            return;
++        }
++        std::fprintf(mFile, format, args...);
++    }
++
++    void nextCommand() {
++        ++mCommandIndex;
++    }
++
++    void captureFramebuffers(GfxRenderingAPI* renderingApi, int frameBuffer, uint32_t width, uint32_t height) {
++        if (!active() || width == 0 || height == 0) {
++            return;
++        }
++
++        if (!mColorPath.empty()) {
++            std::vector<uint16_t> rgba(width * height);
++            renderingApi->ReadFramebufferToCPU(frameBuffer, width, height, rgba.data());
++            FILE* image = std::fopen(mColorPath.c_str(), "wb");
++            if (image == nullptr) {
++                std::fprintf(stderr, "Unable to open OOT_FAST3D_COLOR_CAPTURE '%s': %s\n", mColorPath.c_str(),
++                             std::strerror(errno));
++            } else {
++                std::fprintf(image, "P6\n%u %u\n255\n", width, height);
++                for (uint16_t pixel : rgba) {
++                    uint8_t red = (pixel >> 11) & 0x1f;
++                    uint8_t green = (pixel >> 6) & 0x1f;
++                    uint8_t blue = (pixel >> 1) & 0x1f;
++                    std::fputc((red << 3) | (red >> 2), image);
++                    std::fputc((green << 3) | (green >> 2), image);
++                    std::fputc((blue << 3) | (blue >> 2), image);
++                }
++                std::fclose(image);
++            }
++        }
++
++        if (!mDepthPath.empty()) {
++            std::vector<float> depth(width * height);
++            if (!renderingApi->ReadFramebufferDepthToCPU(frameBuffer, width, height, depth.data())) {
++                std::fprintf(stderr, "The selected graphics backend cannot capture depth\n");
++                return;
++            }
++            FILE* depthFile = std::fopen(mDepthPath.c_str(), "wb");
++            if (depthFile == nullptr) {
++                std::fprintf(stderr, "Unable to open OOT_FAST3D_DEPTH_CAPTURE '%s': %s\n", mDepthPath.c_str(),
++                             std::strerror(errno));
++                return;
++            }
++            std::fwrite(depth.data(), sizeof(float), depth.size(), depthFile);
++            std::fclose(depthFile);
++        }
++    }
++
++  private:
++    FILE* mFile = nullptr;
++    long mFirstFrame = 0;
++    long mFrameCount = 1;
++    long mRunIndex = 0;
++    int mCommandIndex = -1;
++    size_t mMaximumEvents = DefaultMaximumEvents;
++    size_t mEvents = 0;
++    bool mActive = false;
++    bool mOverflowed = false;
++    bool mExitWhenComplete = false;
++    std::string mColorPath;
++    std::string mDepthPath;
++};
++
++Writer& Trace() {
++    static Writer writer;
++    return writer;
++}
++
++void WriteMatrix(Writer& writer, const float matrix[4][4]) {
++    for (int row = 0; row < 4; ++row) {
++        for (int column = 0; column < 4; ++column) {
++            writer.raw("%s%08x", row == 0 && column == 0 ? "" : ",", std::bit_cast<uint32_t>(matrix[row][column]));
++        }
++    }
++}
++
++} // namespace
++
++void ReferenceTraceBeginRun(Interpreter* interpreter) {
++    Trace().beginRun(interpreter->mInterpolationT, interpreter->mInterpolationIndex);
++    ReferenceTraceOperation(interpreter, "clear-target", 0, 1, 1);
++    ReferenceTraceState(interpreter);
++}
++
++void ReferenceTraceEndRun(Interpreter*) {
++    Trace().endRun();
++}
++
++void ReferenceTraceCommand(Interpreter*, const F3DGfx* command, uint32_t microcode, size_t stackDepth) {
++    Writer& writer = Trace();
++    if (!writer.active()) {
++        return;
++    }
++    writer.nextCommand();
++    writer.line("command|%d|%u|%zu|%08x|%016llx\n", writer.commandIndex(), microcode, stackDepth,
++                static_cast<uint32_t>(command->words.w0), static_cast<unsigned long long>(command->words.w1));
++}
++
++void ReferenceTraceResource(Interpreter*, uint8_t opcode, const char* path) {
++    Writer& writer = Trace();
++    writer.line("resource|%d|%u|%s\n", writer.commandIndex(), opcode, path == nullptr ? "" : path);
++}
++
++void ReferenceTraceState(Interpreter* interpreter) {
++    Writer& writer = Trace();
++    if (!writer.active() || interpreter == nullptr) {
++        return;
++    }
++    const RSP& rsp = *interpreter->mRsp;
++    const RDP& rdp = *interpreter->mRdp;
++    if (!writer.beginEvent()) {
++        return;
++    }
++    writer.raw(
++        "state|%d|%08x|%08x|%08x|%08x|%016llx|%08x|%u|%08x|%08x|%08x|%d|%d|%08x|%08x|%u|%d|%08x|%d|%d|%u|%u|%d,%d,%u,%u|%d,%d,%u,%u|",
++        writer.commandIndex(), rsp.geometry_mode, rsp.extra_geometry_mode, rdp.other_mode_h, rdp.other_mode_l,
++        static_cast<unsigned long long>(rdp.combine_mode), PackColor(rdp.prim_color), rdp.prim_lod_fraction,
++        PackColor(rdp.env_color), PackColor(rdp.key_center), PackColor(rdp.key_scale), rdp.convert_k[4], rdp.convert_k[5],
++        PackColor(rdp.fog_color), PackColor(rdp.blend_color), rdp.prim_depth, rdp.grayscale ? 1 : 0,
++        PackColor(rdp.grayscale_color), rsp.fog_mul, rsp.fog_offset, rdp.first_tile_index, rsp.texture_scaling_factor.s,
++        rdp.viewport.x, rdp.viewport.y, rdp.viewport.width, rdp.viewport.height, rdp.scissor.x, rdp.scissor.y,
++        rdp.scissor.width, rdp.scissor.height);
++    for (size_t index = 0; index < 8; ++index) {
++        const auto& tile = rdp.texture_tile[index];
++        writer.raw("%s%08x,%08x,%08x,%08x,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u", index == 0 ? "" : ";",
++                   std::bit_cast<uint32_t>(tile.uls), std::bit_cast<uint32_t>(tile.ult),
++                   std::bit_cast<uint32_t>(tile.lrs), std::bit_cast<uint32_t>(tile.lrt), tile.fmt, tile.siz,
++                   tile.line_size_bytes, tile.tmem, tile.palette, tile.cms, tile.cmt, tile.masks, tile.maskt,
++                   tile.shifts, tile.shiftt, tile.tmem_index);
++    }
++    writer.raw("|");
++    WriteMatrix(writer, rsp.P_matrix);
++    writer.raw("|");
++    const size_t modelViewIndex = rsp.modelview_matrix_stack_size == 0 ? 0 : rsp.modelview_matrix_stack_size - 1;
++    WriteMatrix(writer, rsp.modelview_matrix_stack[modelViewIndex]);
++    writer.raw("\n");
++}
++
++void ReferenceTraceVertex(Interpreter*, size_t index, const LoadedVertex& vertex) {
++    Writer& writer = Trace();
++    writer.line("vertex|%d|%zu|%08x,%08x,%08x,%08x,%08x,%08x,%u,%u,%u,%u,%u\n", writer.commandIndex(), index,
++                std::bit_cast<uint32_t>(vertex.x), std::bit_cast<uint32_t>(vertex.y),
++                std::bit_cast<uint32_t>(vertex.z), std::bit_cast<uint32_t>(vertex.w),
++                std::bit_cast<uint32_t>(vertex.u), std::bit_cast<uint32_t>(vertex.v), vertex.color.r, vertex.color.g,
++                vertex.color.b, vertex.color.a, vertex.clip_rej);
++}
++
++void ReferenceTraceTriangle(Interpreter*, uint8_t first, uint8_t second, uint8_t third, const char* disposition) {
++    Writer& writer = Trace();
++    writer.line("triangle|%d|%u|%u|%u|%s\n", writer.commandIndex(), first, second, third, disposition);
++}
++
++void ReferenceTraceGeometry(Interpreter*, const float* vertices, size_t floatCount) {
++    Writer& writer = Trace();
++    if (!writer.active() || !writer.beginEvent()) {
++        return;
++    }
++    writer.raw("geometry|%d|", writer.commandIndex());
++    for (size_t index = 0; index < floatCount; ++index) {
++        writer.raw("%s%08x", index == 0 ? "" : ",", std::bit_cast<uint32_t>(vertices[index]));
++    }
++    writer.raw("\n");
++}
++
++void ReferenceTraceFramebuffers(GfxRenderingAPI* renderingApi, int frameBuffer, uint32_t width, uint32_t height) {
++    Trace().captureFramebuffers(renderingApi, frameBuffer, width, height);
++}
++
++void ReferenceTraceDraw(Interpreter*, const float* vertices, size_t floatCount, size_t triangleCount) {
++    Writer& writer = Trace();
++    if (!writer.active()) {
++        return;
++    }
++    if (!writer.beginEvent()) {
++        return;
++    }
++    writer.raw("draw|%d|%zu|%zu|", writer.commandIndex(), floatCount, triangleCount);
++    for (size_t index = 0; index < floatCount; ++index) {
++        writer.raw("%s%08x", index == 0 ? "" : ",", std::bit_cast<uint32_t>(vertices[index]));
++    }
++    writer.raw("\n");
++}
++
++void ReferenceTraceOperation(Interpreter*, const char* operation, int first, int second, int third, int fourth) {
++    Writer& writer = Trace();
++    writer.line("operation|%d|%s|%d|%d|%d|%d\n", writer.commandIndex(), operation, first, second, third, fourth);
++}
++
++} // namespace Fast
+diff --git a/libultraship/src/libultraship/libultra/os.cpp b/libultraship/src/libultraship/libultra/os.cpp
+index c19241a..03da6b3 100644
+--- a/libultraship/src/libultraship/libultra/os.cpp
++++ b/libultraship/src/libultraship/libultra/os.cpp
+@@ -1,5 +1,8 @@
+ #include "libultraship/libultraship.h"
+ #include <SDL2/SDL.h>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <ratio>
+ 
+ // Establish a chrono duration for the N64 46.875MHz clock rate
+@@ -11,6 +14,54 @@ extern "C" {
+ uint8_t __osMaxControllers = MAXCONTROLLERS;
+ uint64_t __osCurrentTime = 0;
+ 
++static bool UseDeterministicReferenceTime() {
++    return std::getenv("OOT_FAST3D_DETERMINISTIC_TIME") != nullptr;
++}
++
++static uint64_t sReferenceTime = 0;
++static uint64_t sReferenceFrame = 0;
++static uint64_t sReferenceInputFrame = 0;
++
++void OotReferenceBeginFrame() {
++    if (!UseDeterministicReferenceTime()) {
++        return;
++    }
++    static uint64_t frame = 0;
++    sReferenceFrame = frame++;
++    sReferenceTime = sReferenceFrame * 50000;
++}
++
++static void ApplyDeterministicInput(OSContPad* pad) {
++    const char* script = std::getenv("OOT_FAST3D_INPUT_SCRIPT");
++    if (!UseDeterministicReferenceTime() || script == nullptr) {
++        return;
++    }
++    const uint64_t inputFrame = sReferenceInputFrame++;
++    while (*script != '\0') {
++        unsigned long long first = 0;
++        unsigned long long last = 0;
++        unsigned buttons = 0;
++        int stickX = 0;
++        int stickY = 0;
++        int consumed = 0;
++        if (std::sscanf(script, "%llu-%llu:%x:%d:%d%n", &first, &last, &buttons, &stickX, &stickY, &consumed) !=
++            5) {
++            return;
++        }
++        if (inputFrame >= first && inputFrame <= last) {
++            pad[0].button = static_cast<uint16_t>(buttons);
++            pad[0].stick_x = static_cast<int8_t>(stickX);
++            pad[0].stick_y = static_cast<int8_t>(stickY);
++            return;
++        }
++        const char* next = std::strchr(script + consumed, ';');
++        if (next == nullptr) {
++            return;
++        }
++        script = next + 1;
++    }
++}
++
+ int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* status) {
+     *controllerBits = 0;
+     status->status |= 1;
+@@ -30,6 +81,7 @@ void osContGetReadData(OSContPad* pad) {
+     memset(pad, 0, sizeof(OSContPad) * __osMaxControllers);
+ 
+     Ship::Context::GetRawInstance()->GetControlDeck()->WriteToPad(pad);
++    ApplyDeterministicInput(pad);
+ }
+ 
+ void osSetTime(OSTime time) {
+@@ -40,6 +92,9 @@ void osSetTime(OSTime time) {
+ 
+ // Returns the OS time matching the N64 46.875MHz cycle rate
+ uint64_t osGetTime() {
++    if (UseDeterministicReferenceTime()) {
++        return sReferenceTime;
++    }
+     return std::chrono::duration_cast<n64CycleRateDuration>(std::chrono::steady_clock::now().time_since_epoch())
+                .count() -
+            __osCurrentTime;
+@@ -47,6 +102,9 @@ uint64_t osGetTime() {
+ 
+ // Returns the CPU clock count matching the N64 46.875Mhz cycle rate
+ uint32_t osGetCount() {
++    if (UseDeterministicReferenceTime()) {
++        return static_cast<uint32_t>(sReferenceTime);
++    }
+     return std::chrono::duration_cast<n64CycleRateDuration>(std::chrono::steady_clock::now().time_since_epoch())
+         .count();
+ }
