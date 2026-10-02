@@ -10,11 +10,13 @@ import org.gradle.api.Project
 import org.gradle.kotlin.dsl.configure
 import org.gradle.kotlin.dsl.register
 
-/** Packages the root project's game assets into every Android app variant. */
+/** Packages the root project's game assets unless `-PskipGameAssets=true`. */
 class ZootAndroidPlugin : Plugin<Project> {
     override fun apply(project: Project) {
         project.pluginManager.withPlugin("com.android.application") {
-            configureAssets(project)
+            if (project.providers.gradleProperty("skipGameAssets").orNull != "true") {
+                configureAssets(project)
+            }
         }
     }
 

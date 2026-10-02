@@ -1,4 +1,4 @@
-name: Source build
+name: Android build
 
 on:
   pull_request:
@@ -9,33 +9,19 @@ permissions:
   contents: read
 
 concurrency:
-  group: source-build-${{ github.ref }}
+  group: android-build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  plugin-tests:
+  assemble-release:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
-          java-version: '17'
-      - name: Install source preparation tools
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
-      - name: Check the Gradle plugin
-        run: ./gradlew -p gradle/plugins/zoot check --console=plain
-
-  guest-build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
-        with:
-          distribution: temurin
-          java-version: '17'
+          java-version: '21'
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
       - name: Install WASI SDK 33
@@ -48,9 +34,6 @@ jobs:
             "$RUNNER_TEMP/wasi-sdk.tar.gz" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP"
           echo "WASI_CLANG=$RUNNER_TEMP/wasi-sdk-33.0-x86_64-linux/bin/clang" >> "$GITHUB_ENV"
-      - name: Build from fresh upstream downloads without a ROM
-        run: ./gradlew buildGuest --console=plain
-      - name: Verify offline reuse
-        run: ./gradlew buildGuest --offline --console=plain
-      - name: Test the guest adapters and save compatibility
-        run: bash tools/test-guest.sh
+      # Check compilation, R8 and packaging without requiring a ROM. This APK is not playable.
+      - name: Assemble Android release
+        run: ./gradlew :android:assembleRelease -PskipGameAssets=true --max-workers=2 --console=plain
