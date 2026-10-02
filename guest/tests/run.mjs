@@ -10,13 +10,30 @@ const saves = mkdtempSync(join(tmpdir(), 'zoot-save-test-'));
 function instantiate(name) {
     const wasi = new WASI({ version: 'preview1', preopens: { '/saves': saves } });
     const module = new WebAssembly.Module(readFileSync(join(output, `${name}.wasm`)));
-    const guest = new WebAssembly.Instance(module, { wasi_snapshot_preview1: wasi.wasiImport });
+    const imports = { wasi_snapshot_preview1: wasi.wasiImport };
+    // Scene tests link the real command dispatcher. Unused game subsystems must not run.
+    for (const entry of WebAssembly.Module.imports(module)) {
+        if (entry.module === 'wasi_snapshot_preview1') continue;
+        imports[entry.module] ??= {};
+        imports[entry.module][entry.name] = () => {
+            throw new Error(`Unexpected call to ${entry.module}.${entry.name}`);
+        };
+    }
+    const guest = new WebAssembly.Instance(module, imports);
     wasi.initialize(guest);
     return guest.exports;
 }
 
 try {
     instantiate('language').test_language();
+    instantiate('blob').test_blob();
+    const resources = instantiate('resources');
+    resources.test_curve_animation();
+    resources.test_scene_paths();
+    const scenes = instantiate('scenes');
+    scenes.test_scene_reuse();
+    scenes.test_scene_objects();
+    scenes.test_transition_reuse();
     assert.equal(instantiate('save-upgrade').test_upgrade(), 0, 'legacy save upgrade');
 
     const writer = instantiate('save-io');
@@ -36,7 +53,7 @@ try {
     assert.equal(readFileSync(join(saves, 'save-0.bin')).length, 16);
     assert.equal(reader.read_save(0, size), 16, 'short read');
     assert.equal(reader.valid(1), 0, 'unused slot');
-    console.log('Guest cache, renderer, shader, background, language and save tests passed');
+    console.log('Guest cache, renderer, shader, background, language, resource, scene and save tests passed');
 } finally {
     rmSync(saves, { recursive: true });
 }

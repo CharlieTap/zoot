@@ -1,0 +1,30 @@
+Subject: Load Navi hint scripts from the resource archive.
+
+Upstream-Status: Guest integration; follows soh/soh/z_scene_otr.cpp.
+
+The guest uses the C scene-command executor. Its original ROM loader allocates
+zero bytes because the port's RomFile entries contain names, not ROM addresses,
+and the DMA stub does not load anything. Navi then reads unrelated memory as a
+hint script. Use the archive payload, as Shipwright's ported executor does.
+
+diff --git a/soh/src/code/z_scene.c b/soh/src/code/z_scene.c
+--- a/soh/src/code/z_scene.c
++++ b/soh/src/code/z_scene.c
+@@ -1,6 +1,7 @@
+ #include "global.h"
+ #include "vt.h"
+ #include "soh/ActorDB.h"
++#include <libultraship/bridge/resourcebridge.h>
+ #include <assert.h>
+ 
+ RomFile sNaviMsgFiles[];
+@@ -248,7 +249,8 @@ void Scene_CommandSpecialFiles(PlayState* play, SceneCmd* cmd) {
+     }
+ 
+     if (cmd->specialFiles.cUpElfMsgNum != 0) {
+-        play->cUpElfMsgs = Play_LoadFile(play, &sNaviMsgFiles[cmd->specialFiles.cUpElfMsgNum - 1]);
++        play->cUpElfMsgs =
++            ResourceGetDataByName(sNaviMsgFiles[cmd->specialFiles.cUpElfMsgNum - 1].fileName);
+     }
+ }
+ 

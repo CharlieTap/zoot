@@ -414,6 +414,7 @@ static void* ResourceData(ResourceEntry* entry) {
         case 0x4F50414D: // OPAM
         case 0x4F435654: // OCUT
         case 0x4F424749: // OBGI
+        case 0x4F424C42: // OBLB
             return entry->bytes + 68;
         case 0x4F544558: { // OTEX
             uint32_t version = ReadU32(entry->bytes + 8);
@@ -622,6 +623,31 @@ AnimationHeaderCommon* ResourceMgr_LoadAnimByName(const char* path) {
         segmentPath[pathLength] = '\0';
         animation->segment = ResourceGetDataByName(segmentPath);
         free(segmentPath);
+        entry->parsed = animation;
+    } else if (animationType == 2) {
+        ResourceReader reader = { cursor, entry->bytes + entry->size };
+        TransformUpdateIndex* animation = calloc(1, sizeof(TransformUpdateIndex));
+        ReaderU16(&reader); // Frame count is unused for curve animations.
+        uint32_t referenceCount = ReaderU32(&reader);
+        animation->refIndex = malloc(referenceCount);
+        ReaderBytes(&reader, animation->refIndex, referenceCount);
+
+        uint32_t transformCount = ReaderU32(&reader);
+        animation->transformData = calloc(transformCount, sizeof(TransformData));
+        for (uint32_t i = 0; i < transformCount; i++) {
+            TransformData* transform = &animation->transformData[i];
+            transform->unk_00 = ReaderU16(&reader);
+            transform->unk_02 = (s16)ReaderU16(&reader);
+            transform->unk_04 = (s16)ReaderU16(&reader);
+            transform->unk_06 = (s16)ReaderU16(&reader);
+            transform->unk_08 = ReaderF32(&reader);
+        }
+
+        uint32_t copyCount = ReaderU32(&reader);
+        animation->copyValues = malloc(copyCount * sizeof(s16));
+        for (uint32_t i = 0; i < copyCount; i++) {
+            animation->copyValues[i] = (s16)ReaderU16(&reader);
+        }
         entry->parsed = animation;
     }
     return entry->parsed;
@@ -1095,14 +1121,12 @@ static SceneCmd* ParseSceneResource(ResourceEntry* entry) {
             }
             case 13: {
                 uint32_t pathCount = ReaderU32(&reader);
-                Path* paths = calloc(pathCount, sizeof(Path));
                 for (uint32_t i = 0; i < pathCount; i++) {
                     char* path = ReaderString(&reader);
-                    Path* loaded = LoadPathByName(path);
-                    if (loaded != NULL) paths[i] = loaded[0];
+                    // Each resource contains the complete path list.
+                    if (i == 0) command->pathList.segment = LoadPathByName(path);
                     free(path);
                 }
-                command->pathList.segment = paths;
                 break;
             }
             case 14: {

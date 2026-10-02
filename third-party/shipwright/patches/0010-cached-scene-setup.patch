@@ -1,0 +1,92 @@
+Subject: Preserve cached scene data and match Shipwright scene setup.
+
+Upstream-Status: Guest integration; follows soh/soh/z_scene_otr.cpp.
+
+The guest caches parsed C scene commands. Stop at an alternate header without
+rewriting that cache, bound object comparisons by the incoming list, and reset
+transition actor IDs when a scene is loaded again.
+
+--- a/soh/src/code/z_scene.c
++++ b/soh/src/code/z_scene.c
+@@ -6,6 +6,8 @@
+ 
+ RomFile sNaviMsgFiles[];
+ 
++static bool Scene_CommandAlternateHeaderList(PlayState* play, SceneCmd* cmd);
++
+ s32 Object_Spawn(ObjectContext* objectCtx, s16 objectId) {
+     size_t size;
+ 
+@@ -187,7 +189,11 @@
+             break;
+         }
+ 
+-        if (cmdCode < ARRAY_COUNT(gSceneCmdHandlers)) {
++        if (cmdCode == SCENE_CMD_ID_ALTERNATE_HEADER_LIST) {
++            if (Scene_CommandAlternateHeaderList(play, sceneCmd)) {
++                break;
++            }
++        } else if (cmdCode < ARRAY_COUNT(gSceneCmdHandlers)) {
+             gSceneCmdHandlers[cmdCode](play, sceneCmd);
+         } else {
+             osSyncPrintf(VT_FGCOL(RED));
+@@ -281,7 +287,7 @@
+     status = &play->objectCtx.status[i];
+ 
+     while (i < play->objectCtx.num) {
+-        if (status->id != *objectEntry) {
++        if (k >= cmd->objectList.num || status->id != *objectEntry) {
+             status2 = &play->objectCtx.status[i];
+             for (j = i; j < play->objectCtx.num; j++) {
+                 status2->id = OBJECT_INVALID;
+@@ -331,6 +337,10 @@
+ void Scene_CommandTransitionActorList(PlayState* play, SceneCmd* cmd) {
+     play->transiActorCtx.numActors = cmd->transiActorList.num;
+     play->transiActorCtx.list = SEGMENTED_TO_VIRTUAL(cmd->transiActorList.segment);
++
++    for (s32 i = 0; i < play->transiActorCtx.numActors; i++) {
++        play->transiActorCtx.list[i].id = ABS(play->transiActorCtx.list[i].id);
++    }
+ }
+ 
+ void TransitionActor_InitContext(GameState* state, TransitionActorContext* transiActorCtx) {
+@@ -420,7 +430,7 @@
+     play->roomCtx.curRoom.echo = cmd->echoSettings.echo;
+ }
+ 
+-void Scene_CommandAlternateHeaderList(PlayState* play, SceneCmd* cmd) {
++static bool Scene_CommandAlternateHeaderList(PlayState* play, SceneCmd* cmd) {
+     s32 pad;
+     SceneCmd* altHeader;
+ 
+@@ -433,7 +443,7 @@
+ 
+         if (altHeader != NULL) {
+             Scene_ExecuteCommands(play, SEGMENTED_TO_VIRTUAL(altHeader));
+-            (cmd + 1)->base.code = SCENE_CMD_ID_END;
++            return true;
+         } else {
+             // "Coughh! There is no specified dataaaaa!"
+             osSyncPrintf("\nげぼはっ！ 指定されたデータがないでええっす！");
+@@ -446,11 +456,12 @@
+ 
+                 if (altHeader != NULL) {
+                     Scene_ExecuteCommands(play, SEGMENTED_TO_VIRTUAL(altHeader));
+-                    (cmd + 1)->base.code = SCENE_CMD_ID_END;
++                    return true;
+                 }
+             }
+         }
+     }
++    return false;
+ }
+ 
+ void Scene_CommandCutsceneData(PlayState* play, SceneCmd* cmd) {
+@@ -504,6 +515,6 @@
+     Scene_CommandSoundSettings,       // SCENE_CMD_ID_SOUND_SETTINGS
+     Scene_CommandEchoSettings,        // SCENE_CMD_ID_ECHO_SETTINGS
+     Scene_CommandCutsceneData,        // SCENE_CMD_ID_CUTSCENE_DATA
+-    Scene_CommandAlternateHeaderList, // SCENE_CMD_ID_ALTERNATE_HEADER_LIST
++    NULL,                            // SCENE_CMD_ID_ALTERNATE_HEADER_LIST: handled by Scene_ExecuteCommands
+     Scene_CommandMiscSettings,        // SCENE_CMD_ID_MISC_SETTINGS
+ };

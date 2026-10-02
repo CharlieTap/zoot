@@ -29,6 +29,8 @@ compiler, SDK and system libraries remain build prerequisites, not pinned inputs
 6. **Torch dependencies:** omit the Banjo-Kazooie audio importer dependencies in an OoT-only build.
 7. **Magic meter:** avoid reading past the extracted fill texture when loading its HUD tile.
 8. **Texture paths:** check cached resource names when a font or UI buffer is reused.
+9. **Navi hints:** load hint scripts from the archive instead of the unused ROM loader.
+10. **Scene reuse:** preserve cached commands, respect shorter object lists and reset door markers.
 
 The first three patches preserve the previous source modifications, including
 reference-renderer code not used by the guest. The fourth only changes CMake.

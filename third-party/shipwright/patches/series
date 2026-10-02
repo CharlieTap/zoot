@@ -6,3 +6,5 @@
 0006-torch-optional-audio-importer.patch
 0007-magic-meter-texture-bounds.patch
 0008-validate-cached-resource-path.patch
+0009-navi-hint-resources.patch
+0010-cached-scene-setup.patch

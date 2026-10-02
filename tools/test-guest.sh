@@ -47,4 +47,16 @@ fi
 "$wasi" --target=wasm32-wasip1 -O3 -DF3DEX_GBI_2=1 "${includes[@]}" \
     -I"$source/soh/include" -I"$source/soh" guest/tests/save_upgrade.c \
     -mexec-model=reactor -Wl,--export-memory -o "$output/save-upgrade.wasm"
+
+"$wasi" --target=wasm32-wasip1 -O3 -DF3DEX_GBI_2=1 "${includes[@]}" \
+    -I"$source/soh/include" -I"$source/soh" guest/tests/blob.c \
+    -mexec-model=reactor -o "$output/blob.wasm"
+
+"$wasi" --target=wasm32-wasip1 -O3 -DF3DEX_GBI_2=1 "${includes[@]}" \
+    -I"$source/soh/include" -I"$source/soh" guest/tests/resources.c \
+    -mexec-model=reactor -o "$output/resources.wasm"
+
+"$wasi" --target=wasm32-wasip1 -O3 -DF3DEX_GBI_2=1 -DLOG_LEVEL_GAME_PRINTS=6 "${includes[@]}" \
+    -I"$source/soh/include" -I"$source/soh" -I"$source/soh/src" guest/tests/scenes.c \
+    -mexec-model=reactor -Wl,--allow-undefined -o "$output/scenes.wasm"
 node guest/tests/run.mjs "$output"
