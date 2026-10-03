@@ -9,6 +9,7 @@ enum class GameAsset(
     val fileName: String,
 ) {
     Wasm("oot.wasm"),
+    WasmSha256("oot.wasm.sha256"),
     OotArchive("oot.o2r"),
     SohArchive("soh.o2r"),
     Language("language.txt"),

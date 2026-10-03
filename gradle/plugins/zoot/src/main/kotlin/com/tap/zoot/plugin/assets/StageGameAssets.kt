@@ -35,7 +35,7 @@ abstract class StageGameAssets
         @TaskAction
         fun stage() {
             files.sync {
-                from(assets) { include("*.o2r", "*.wasm", "language.txt", "THIRD_PARTY_NOTICES.txt") }
+                from(assets) { include("*.o2r", "*.wasm", "*.wasm.sha256", "language.txt", "THIRD_PARTY_NOTICES.txt") }
                 into(outputDirectory)
             }
         }

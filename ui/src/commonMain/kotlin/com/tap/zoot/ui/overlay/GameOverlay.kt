@@ -10,26 +10,24 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.unit.dp
 import com.tap.zoot.graphics.upscaler.Upscaler
 import com.tap.zoot.performance.PerformanceTelemetry
-import com.tap.zoot.runtime.controller.GameState
 import com.tap.zoot.settings.GameSettings
 import com.tap.zoot.ui.GameBackHandler
 import com.tap.zoot.ui.GameScreenState
 import com.tap.zoot.ui.components.SettingsIconButton
 import com.tap.zoot.ui.performance.PerformanceOverlay
 import com.tap.zoot.ui.settings.SettingsPanel
+import com.tap.zoot.ui.theme.ZootColors
 
 @Composable
 internal fun GameOverlay(
     screen: GameScreenState,
     settings: GameSettings,
-    gameState: GameState,
     upscalers: List<Upscaler>,
     telemetry: PerformanceTelemetry,
     modifier: Modifier = Modifier,
@@ -40,7 +38,7 @@ internal fun GameOverlay(
             Box(
                 Modifier
                     .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.45f))
+                    .background(ZootColors.Scrim)
                     .pointerInput(screen) { detectTapGestures { screen.closeMenu() } }
                     .clearAndSetSemantics {},
             )
@@ -58,7 +56,6 @@ internal fun GameOverlay(
                 if (settings.diagnostics.performanceOverlay) {
                     PerformanceOverlay(
                         telemetry,
-                        gameState,
                         Modifier.align(Alignment.TopCenter).padding(top = 8.dp),
                         paused = screen.menuOpen,
                     )

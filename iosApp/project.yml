@@ -19,6 +19,8 @@ targets:
       - path: Resources
       - path: ../ios/build/game-assets/oot.wasm
         buildPhase: resources
+      - path: ../ios/build/game-assets/oot.wasm.sha256
+        buildPhase: resources
       - path: ../ios/build/game-assets/oot.o2r
         buildPhase: resources
       - path: ../ios/build/game-assets/soh.o2r

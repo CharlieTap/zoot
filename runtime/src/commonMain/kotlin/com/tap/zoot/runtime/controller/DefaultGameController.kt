@@ -1,9 +1,12 @@
 package com.tap.zoot.runtime.controller
 
+import com.tap.crashreporting.CrashReport
+import com.tap.crashreporting.CrashReportingConfig
 import com.tap.n64.input.N64Input
 import com.tap.zoot.graphics.Renderer
 import com.tap.zoot.graphics.RendererFactory
 import com.tap.zoot.runtime.benchmark.BenchmarkSession
+import com.tap.zoot.runtime.diagnostics.CrashEnvironmentProvider
 import com.tap.zoot.runtime.engine.GameEngine
 import com.tap.zoot.runtime.engine.GuestAbi
 import com.tap.zoot.runtime.platform.GameThread
@@ -15,6 +18,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -35,26 +39,49 @@ class DefaultGameController(
     private val telemetry: FrameTelemetry,
     private val logger: Logger,
     private val clock: MonotonicClock,
+    private val crashEnvironment: CrashEnvironmentProvider,
+    private val crashReporting: CrashReportingConfig,
 ) : GameController {
     private val scope = CoroutineScope(SupervisorJob() + gameThread.dispatcher)
     private val mutableState = MutableStateFlow<GameState>(GameState.Detached)
     private val active = MutableStateFlow(false)
     private val configuration = MutableStateFlow<GameConfiguration?>(null)
     private var session: Job? = null
+    private var rendererFactory: RendererFactory? = null
     private var benchmark: BenchmarkSession? = null
 
     override val state: StateFlow<GameState> = mutableState.asStateFlow()
 
     override fun attach(rendererFactory: RendererFactory) {
-        detach()
-        session = scope.launch { runSession(rendererFactory) }
+        stopSession()
+        this.rendererFactory = rendererFactory
+        if (mutableState.value !is GameState.Failed) startSession(rendererFactory)
     }
 
     override fun detach() {
-        session?.cancel()
-        session = null
-        input.releaseAll()
+        stopSession()
+        rendererFactory = null
+        if (mutableState.value !is GameState.Failed) mutableState.value = GameState.Detached
+    }
+
+    override fun restart() {
+        if (mutableState.value !is GameState.Failed) return
         mutableState.value = GameState.Detached
+        rendererFactory?.let(::startSession)
+    }
+
+    private fun startSession(rendererFactory: RendererFactory) {
+        val previous = session
+        session =
+            scope.launch {
+                previous?.cancelAndJoin()
+                runSession(rendererFactory)
+            }
+    }
+
+    private fun stopSession() {
+        session?.cancel()
+        input.releaseAll()
     }
 
     override fun setActive(active: Boolean) {
@@ -73,10 +100,12 @@ class DefaultGameController(
     private suspend fun runSession(rendererFactory: RendererFactory) {
         mutableState.value = GameState.Starting
         telemetry.reset()
+        var started = false
         try {
             val initial = configuration.filterNotNull().first()
             rendererFactory.create(initial.upscaler).use { renderer ->
                 engineFactory.create(renderer).use { engine ->
+                    started = true
                     SessionLoop(engine, renderer, benchmark).run()
                 }
             }
@@ -84,7 +113,9 @@ class DefaultGameController(
             throw cancelled
         } catch (failure: Throwable) {
             logger.error("Game failed", failure)
-            mutableState.value = GameState.Failed(failure)
+            input.releaseAll()
+            val report = CrashReport(failure, crashEnvironment.environment(), crashReporting)
+            mutableState.value = GameState.Failed(report, duringStartup = !started)
         }
     }
 

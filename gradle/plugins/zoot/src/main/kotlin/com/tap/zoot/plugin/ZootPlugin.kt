@@ -3,6 +3,7 @@ package com.tap.zoot.plugin
 import com.tap.zoot.plugin.assets.PackSupportArchive
 import com.tap.zoot.plugin.assets.StageGameAssets
 import com.tap.zoot.plugin.guest.BuildGuest
+import com.tap.zoot.plugin.guest.GenerateGuestIdentity
 import com.tap.zoot.plugin.rom.ExtractRomAssets
 import com.tap.zoot.plugin.rom.ROM_PATTERNS
 import com.tap.zoot.plugin.rom.SelectRom
@@ -156,6 +157,14 @@ class ZootPlugin : Plugin<Project> {
                     wasm.set(layout.buildDirectory.file("generated/guest/oot.wasm"))
                 }
 
+            val generateGuestIdentity =
+                tasks.register<GenerateGuestIdentity>("generateGuestIdentity") {
+                    group = GROUP
+                    description = "Hash the shipped Wasm guest for crash reports."
+                    wasm.set(buildGuest.flatMap { it.wasm })
+                    identity.set(layout.buildDirectory.file("generated/guest-identity/oot.wasm.sha256"))
+                }
+
             val prepareGameAssets =
                 tasks.register<StageGameAssets>("prepareGameAssets") {
                     group = GROUP
@@ -165,6 +174,7 @@ class ZootPlugin : Plugin<Project> {
                         extractRomAssets.flatMap { it.archive },
                         writeGameLanguage.flatMap { it.languageFile },
                         buildGuest.flatMap { it.wasm },
+                        generateGuestIdentity.flatMap { it.identity },
                         zoot.notices,
                     )
                     outputDirectory.set(layout.buildDirectory.dir("game-assets"))

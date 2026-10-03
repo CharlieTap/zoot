@@ -65,7 +65,7 @@ private fun UpscalerSelector(
             ) {
                 BasicText(
                     upscaler.name,
-                    style = ZootTextStyles.Label.copy(color = if (selected) Color(0xff141719) else ZootColors.Text, fontSize = 12.sp),
+                    style = ZootTextStyles.Label.copy(color = if (selected) ZootColors.OnMint else ZootColors.Text, fontSize = 12.sp),
                 )
             }
         }

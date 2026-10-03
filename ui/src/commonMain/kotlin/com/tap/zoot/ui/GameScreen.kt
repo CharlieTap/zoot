@@ -1,6 +1,7 @@
 package com.tap.zoot.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.size
@@ -13,10 +14,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.unit.roundToIntRect
 import com.tap.zoot.runtime.controller.GameConfiguration
 import com.tap.zoot.runtime.controller.GameController
+import com.tap.zoot.runtime.controller.GameState
 import com.tap.zoot.ui.controls.GameControls
+import com.tap.zoot.ui.crash.GameCrashDialog
 import com.tap.zoot.ui.overlay.GameOverlay
 import com.tap.zoot.ui.theme.ZootColors
 
@@ -32,6 +36,7 @@ fun GameScreen(
     val gameState by controller.state.collectAsState()
     val screen = rememberGameScreenState(dependencies.settings)
     val gameActive = screen.isGameActive(active)
+    val failure = gameState as? GameState.Failed
 
     LaunchedEffect(settings.display.upscaler, settings.volumes, dependencies.upscalers) {
         controller.configure(GameConfiguration(dependencies.upscalers[settings.display.upscaler], settings.volumes))
@@ -52,26 +57,29 @@ fun GameScreen(
 
     BoxWithConstraints(modifier.fillMaxSize().background(ZootColors.Background)) {
         val gameHeight = minOf(maxHeight, maxWidth * 3 / 4)
-        dependencies.surface.Content(
-            onRendererFactoryChanged = { screen.rendererFactory = it },
-            modifier =
-                Modifier
-                    .align(Alignment.Center)
-                    .size(gameHeight * 4 / 3, gameHeight)
-                    .onGloballyPositioned { screen.gameBounds = it.boundsInRoot().roundToIntRect() },
-        )
-        GameControls(
-            input = dependencies.input,
-            controls = settings.controls,
-            enabled = active && !screen.menuOpen,
-            editor = screen.editor,
-            onFinishEditing = screen::finishEditing,
-        )
-        if (screen.editor == null) {
+        Box(if (failure == null) Modifier.fillMaxSize() else Modifier.fillMaxSize().clearAndSetSemantics {}) {
+            dependencies.surface.Content(
+                onRendererFactoryChanged = { screen.rendererFactory = it },
+                modifier =
+                    Modifier
+                        .align(Alignment.Center)
+                        .size(gameHeight * 4 / 3, gameHeight)
+                        .onGloballyPositioned { screen.gameBounds = it.boundsInRoot().roundToIntRect() },
+            )
+            GameControls(
+                input = dependencies.input,
+                controls = settings.controls,
+                enabled = active && !screen.menuOpen && failure == null,
+                editor = screen.editor,
+                onFinishEditing = screen::finishEditing,
+            )
+        }
+        if (failure != null) {
+            GameCrashDialog(failure, dependencies.crashReporting, onRestart = controller::restart)
+        } else if (screen.editor == null) {
             GameOverlay(
                 screen = screen,
                 settings = settings,
-                gameState = gameState,
                 upscalers = dependencies.upscalers.options,
                 telemetry = dependencies.telemetry,
             )

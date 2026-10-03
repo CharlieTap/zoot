@@ -9,6 +9,7 @@ import com.tap.zoot.runtime.platform.monotonicNanos
 import com.tap.zoot.runtime.resources.GameAsset
 import com.tap.zoot.runtime.resources.GameAssets
 import com.tap.zoot.runtime.resources.writeI32
+import io.github.charlietap.chasm.config.RuntimeConfig
 import io.github.charlietap.chasm.embedding.codegen.CodegenImport
 import io.github.charlietap.chasm.embedding.dropStore
 import io.github.charlietap.chasm.embedding.instance
@@ -40,7 +41,10 @@ internal class Guest(
                 imports = imports,
                 instanceFactory = { store, decodedModule, imports ->
                     this.store = store
-                    instance(store, decodedModule, imports).expect("Instantiate guest").also { instance = it }
+                    instance(store, decodedModule, imports, RuntimeConfig(debugInfo = true)).expect("Instantiate guest").also {
+                        instance =
+                            it
+                    }
                 },
             )
         check(module.ootAbiVersion() == GuestAbi.VERSION)

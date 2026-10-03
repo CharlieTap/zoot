@@ -12,6 +12,26 @@ plugins {
     alias(libs.plugins.conventions.linting)
     alias(libs.plugins.metro)
     alias(libs.plugins.chasm)
+    alias(libs.plugins.buildconfig)
+}
+
+val githubRepositoryUrl =
+    providers.gradleProperty("crashReporting.githubRepositoryUrl").map { configured ->
+        val url = configured.trim().removeSuffix("/")
+        require(Regex("https://github\\.com/[A-Za-z0-9-]+/[A-Za-z0-9._-]+").matches(url)) {
+            "crashReporting.githubRepositoryUrl must be an HTTPS GitHub repository URL, such as https://github.com/owner/repository: $configured"
+        }
+        url
+    }
+
+buildConfig {
+    packageName("com.tap.zoot.runtime.config")
+    className("ZootBuildConfig")
+    useKotlinOutput { internalVisibility = true }
+    buildConfigField("GITHUB_REPOSITORY_URL", githubRepositoryUrl)
+    buildConfigField("APPLICATION_NAME", "zoot")
+    buildConfigField("APPLICATION_VERSION", libs.versions.version.name)
+    buildConfigField("CHASM_VERSION", libs.versions.chasm.asProvider())
 }
 
 chasm {
@@ -73,6 +93,7 @@ kotlin {
         api(projects.audio)
         api(projects.graphics.core)
         api(projects.n64Input)
+        api(projects.crashReporting)
         api(libs.chasm)
         implementation(libs.coroutines.core)
     }

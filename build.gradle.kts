@@ -20,6 +20,7 @@ tasks.register("fmt") {
     dependsOn(
         ":android:fmt",
         ":audio:fmt",
+        ":crash-reporting:fmt",
         ":graphics:core:fmt",
         ":graphics:backend:webgpu:fmt",
         ":graphics:upscaler:sgsr1:fmt",

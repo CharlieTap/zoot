@@ -9,11 +9,13 @@ import androidx.compose.ui.unit.sp
 
 internal object ZootColors {
     val Mint = Color(0xff9cf0cf)
+    val OnMint = Color(0xff141719)
     val Panel = Color(0xf5141719)
     val Border = Color(0xff61696e)
     val Text = Color(0xfff4f5f5)
     val Muted = Color(0xffb2bec7)
     val Background = Color(0xff121619)
+    val Scrim = Color.Black.copy(alpha = 0.45f)
 }
 
 internal object ZootTextStyles {

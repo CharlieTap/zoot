@@ -1,5 +1,7 @@
 package com.tap.zoot.runtime.controller
 
+import com.tap.crashreporting.CrashEnvironment
+import com.tap.crashreporting.CrashReportingConfig
 import com.tap.n64.input.ControllerState
 import com.tap.n64.input.N64Input
 import com.tap.zoot.graphics.Renderer
@@ -9,6 +11,7 @@ import com.tap.zoot.graphics.upscaler.Upscaler
 import com.tap.zoot.graphics.upscaler.UpscalerId
 import com.tap.zoot.runtime.TestRenderer
 import com.tap.zoot.runtime.benchmark.BenchmarkSession
+import com.tap.zoot.runtime.diagnostics.CrashEnvironmentProvider
 import com.tap.zoot.runtime.engine.GameEngine
 import com.tap.zoot.runtime.engine.HostTimings
 import com.tap.zoot.runtime.platform.GameThread
@@ -23,6 +26,8 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -90,13 +95,162 @@ class DefaultGameControllerTest {
     @Test
     fun startupFailureIsReportedAsState() =
         runTest {
-            val failure = IllegalStateException("No guest")
-            val controller = controller(engineFactory = { throw failure })
+            val controller = controller(engineFactory = { throw IllegalStateException("No guest") })
             try {
                 controller.configure(GameConfiguration(TestUpscaler, GameVolumes()))
                 controller.attach(RendererFactory { TestRenderer() })
                 runCurrent()
-                assertEquals(GameState.Failed(failure), controller.state.value)
+                val failed = assertIs<GameState.Failed>(controller.state.value)
+                assertTrue(failed.duringStartup)
+                assertEquals("Crash: IllegalStateException", failed.report.title)
+            } finally {
+                controller.close()
+                runCurrent()
+            }
+        }
+
+    @Test
+    fun stepFailureReleasesResourcesAndInput() =
+        runTest {
+            val engine = FakeEngine(failStepAt = 2)
+            val renderer = TestRenderer()
+            val input = N64Input()
+            val controller = controller(engine, input = input)
+            try {
+                controller.configure(GameConfiguration(TestUpscaler, GameVolumes()))
+                controller.attach(RendererFactory { renderer })
+                controller.setActive(true)
+                input.pressButtons(0x8000)
+                runCurrent()
+                advanceTimeBy(100)
+                runCurrent()
+
+                val failed = assertIs<GameState.Failed>(controller.state.value)
+                assertFalse(failed.duringStartup)
+                assertTrue(engine.closed)
+                assertTrue(renderer.closed)
+                assertEquals(0, input.poll().buttons)
+            } finally {
+                controller.close()
+                runCurrent()
+            }
+        }
+
+    @Test
+    fun audioFailureIsReportedAsState() =
+        runTest {
+            val engine = FakeEngine(failAudio = true)
+            val controller = controller(engine)
+            try {
+                controller.configure(GameConfiguration(TestUpscaler, GameVolumes()))
+                controller.attach(RendererFactory { TestRenderer() })
+                controller.setActive(true)
+                runCurrent()
+
+                assertIs<GameState.Failed>(controller.state.value)
+                assertTrue(engine.closed)
+            } finally {
+                controller.close()
+                runCurrent()
+            }
+        }
+
+    @Test
+    fun detachingARunningGameIsNotAFailure() =
+        runTest {
+            val engine = FakeEngine()
+            val controller = controller(engine)
+            try {
+                controller.configure(GameConfiguration(TestUpscaler, GameVolumes()))
+                controller.attach(RendererFactory { TestRenderer() })
+                controller.setActive(true)
+                runCurrent()
+
+                controller.detach()
+                runCurrent()
+
+                assertEquals(GameState.Detached, controller.state.value)
+                assertTrue(engine.closed)
+            } finally {
+                controller.close()
+                runCurrent()
+            }
+        }
+
+    @Test
+    fun failureSurvivesDetachAndReattach() =
+        runTest {
+            var sessions = 0
+            val controller =
+                controller(engineFactory = {
+                    sessions++
+                    FakeEngine(failStepAt = 1)
+                })
+            try {
+                controller.configure(GameConfiguration(TestUpscaler, GameVolumes()))
+                controller.attach(RendererFactory { TestRenderer() })
+                controller.setActive(true)
+                runCurrent()
+                val failed = assertIs<GameState.Failed>(controller.state.value)
+
+                controller.detach()
+                controller.attach(RendererFactory { TestRenderer() })
+                runCurrent()
+
+                assertEquals(failed, controller.state.value)
+                assertEquals(1, sessions)
+            } finally {
+                controller.close()
+                runCurrent()
+            }
+        }
+
+    @Test
+    fun restartStartsExactlyOneFreshSession() =
+        runTest {
+            val engines = mutableListOf<FakeEngine>()
+            val controller = controller(engineFactory = { FakeEngine(failStepAt = if (engines.isEmpty()) 1 else 0).also(engines::add) })
+            try {
+                controller.configure(GameConfiguration(TestUpscaler, GameVolumes()))
+                controller.attach(RendererFactory { TestRenderer() })
+                controller.setActive(true)
+                runCurrent()
+                assertIs<GameState.Failed>(controller.state.value)
+
+                controller.restart()
+                controller.restart()
+                runCurrent()
+
+                assertEquals(2, engines.size)
+                assertTrue(engines.first().closed)
+                assertEquals(GameState.Running, controller.state.value)
+            } finally {
+                controller.close()
+                runCurrent()
+            }
+        }
+
+    @Test
+    fun restartWithoutASurfaceWaitsForAttach() =
+        runTest {
+            var sessions = 0
+            val controller = controller(engineFactory = { FakeEngine(failStepAt = if (sessions++ == 0) 1 else 0) })
+            try {
+                controller.configure(GameConfiguration(TestUpscaler, GameVolumes()))
+                controller.attach(RendererFactory { TestRenderer() })
+                controller.setActive(true)
+                runCurrent()
+                controller.detach()
+
+                controller.restart()
+                runCurrent()
+                assertEquals(GameState.Detached, controller.state.value)
+                assertEquals(1, sessions)
+
+                controller.attach(RendererFactory { TestRenderer() })
+                runCurrent()
+                assertEquals(2, sessions)
+                assertEquals(GameState.Running, controller.state.value)
             } finally {
                 controller.close()
                 runCurrent()
@@ -106,15 +260,18 @@ class DefaultGameControllerTest {
     private fun TestScope.controller(
         engine: GameEngine = FakeEngine(),
         engineFactory: GameEngine.Factory = GameEngine.Factory { engine },
+        input: N64Input = N64Input(),
     ): DefaultGameController {
         val dispatcher = StandardTestDispatcher(testScheduler)
         return DefaultGameController(
             engineFactory = engineFactory,
             gameThread = TestGameThread(dispatcher),
-            input = N64Input(),
+            input = input,
             telemetry = TestTelemetry,
             logger = TestLogger,
             clock = MonotonicClock { testScheduler.currentTime * 1_000_000 },
+            crashEnvironment = TestCrashEnvironment,
+            crashReporting = CrashReportingConfig("game", "https://github.com/owner/game"),
         )
     }
 
@@ -124,7 +281,10 @@ class DefaultGameControllerTest {
         override fun close() = Unit
     }
 
-    private class FakeEngine : GameEngine {
+    private class FakeEngine(
+        private val failStepAt: Int = 0,
+        private val failAudio: Boolean = false,
+    ) : GameEngine {
         override val timings = HostTimings()
         var steps = 0
         var audioMixes = 0
@@ -139,10 +299,12 @@ class DefaultGameControllerTest {
         ) {
             if (steps == 0) firstButtons = input.buttons
             steps++
+            check(steps != failStepAt) { "Step failed" }
         }
 
         override fun mixAudio() {
             audioMixes++
+            check(!failAudio) { "Audio failed" }
         }
 
         override fun traceEntrance(entrance: Int) {
@@ -213,6 +375,10 @@ class DefaultGameControllerTest {
             audioNanos: Long,
             graphicsNanos: Long,
         ) = Unit
+    }
+
+    private object TestCrashEnvironment : CrashEnvironmentProvider {
+        override fun environment() = CrashEnvironment("1.0", "2.2.0", null, "Test", null, null)
     }
 
     private object TestLogger : Logger {

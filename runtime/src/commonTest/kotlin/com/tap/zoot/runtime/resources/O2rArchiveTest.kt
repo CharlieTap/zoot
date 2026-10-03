@@ -132,7 +132,7 @@ class O2rArchiveTest {
                         when (asset) {
                             GameAsset.OotArchive -> oot
                             GameAsset.SohArchive -> soh
-                            GameAsset.Wasm, GameAsset.Language -> error("Not an archive: $asset")
+                            GameAsset.Wasm, GameAsset.WasmSha256, GameAsset.Language -> error("Not an archive: $asset")
                         }
                 },
             decoder = decoder,

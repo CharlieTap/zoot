@@ -17,7 +17,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
@@ -35,7 +34,6 @@ import com.tap.zoot.performance.FrameHistory
 import com.tap.zoot.performance.METRICS_WINDOW_NANOS
 import com.tap.zoot.performance.PerformanceMetrics
 import com.tap.zoot.performance.PerformanceTelemetry
-import com.tap.zoot.runtime.controller.GameState
 import com.tap.zoot.runtime.platform.monotonicNanos
 import com.tap.zoot.ui.theme.PanelShape
 import com.tap.zoot.ui.theme.ZootColors
@@ -70,19 +68,17 @@ internal class OverlayState {
 @Composable
 fun PerformanceOverlay(
     telemetry: PerformanceTelemetry,
-    gameState: GameState,
     modifier: Modifier = Modifier,
     paused: Boolean = false,
 ) {
     val state = remember(telemetry) { OverlayState() }
-    val currentGameState = rememberUpdatedState(gameState)
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     LaunchedEffect(telemetry, lifecycle, paused) {
         if (paused) {
             telemetry.copyInto(state.history)
             val history = state.history
             val now = if (history.isEmpty) monotonicNanos() else history.newestTime
-            state.message = statusMessage(currentGameState.value, history)
+            state.message = statusMessage(history)
             state.metrics = history.metrics(now)
             state.drawTime = now
             return@LaunchedEffect
@@ -94,7 +90,7 @@ fun PerformanceOverlay(
                 val now = withFrameNanos { monotonicNanos() }
                 if (now >= nextPoll) {
                     telemetry.copyInto(state.history)
-                    val message = statusMessage(currentGameState.value, state.history)
+                    val message = statusMessage(state.history)
                     if (state.message != null && message == null) nextReadout = now
                     state.message = message
                     nextPoll = now + POLL_INTERVAL_NANOS
@@ -111,15 +107,7 @@ fun PerformanceOverlay(
     OverlayPanel(state, modifier)
 }
 
-private fun statusMessage(
-    gameState: GameState,
-    history: FrameHistory,
-): String? =
-    when {
-        gameState is GameState.Failed -> gameState.cause.message ?: "Unable to start the game"
-        history.isEmpty -> INITIALISING
-        else -> null
-    }
+private fun statusMessage(history: FrameHistory): String? = if (history.isEmpty) INITIALISING else null
 
 @Composable
 internal fun OverlayPanel(
