@@ -10,6 +10,7 @@ import com.tap.zoot.graphics.native.oot_gpu_copy
 import com.tap.zoot.graphics.native.oot_gpu_create
 import com.tap.zoot.graphics.native.oot_gpu_delete_texture
 import com.tap.zoot.graphics.native.oot_gpu_depth
+import com.tap.zoot.graphics.native.oot_gpu_depths
 import com.tap.zoot.graphics.native.oot_gpu_destroy
 import com.tap.zoot.graphics.native.oot_gpu_draw
 import com.tap.zoot.graphics.native.oot_gpu_end
@@ -30,6 +31,7 @@ import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.interpretCPointer
 import kotlinx.cinterop.objcPtr
+import kotlinx.cinterop.reinterpret
 import kotlinx.cinterop.usePinned
 import platform.QuartzCore.CAMetalLayer
 
@@ -41,6 +43,7 @@ class IosWebGpuRenderer(
     @Assisted upscaler: Upscaler,
 ) : Renderer {
     private val drawState = ByteArray(DrawState.SIZE)
+    private var guest = ByteArray(0)
     private var readback = ByteArray(0)
     private val gpu =
         checkNotNull(
@@ -71,12 +74,13 @@ class IosWebGpuRenderer(
 
     override fun uploadTexture(
         textureId: Int,
-        pixels: ByteArray,
-        offset: Int,
+        memory: HostMemory,
+        pixels: Int,
         width: Int,
         height: Int,
     ) {
-        pixels.usePinned { oot_gpu_texture(gpu, textureId, it.addressOf(offset), width, height) }
+        val bytes = copy(memory, pixels, width * height * 4)
+        bytes.usePinned { oot_gpu_texture(gpu, textureId, it.addressOf(0), width, height) }
     }
 
     override fun deleteTexture(textureId: Int) = oot_gpu_delete_texture(gpu, textureId)
@@ -98,14 +102,14 @@ class IosWebGpuRenderer(
     override fun draw(
         memory: HostMemory,
         drawState: Int,
-        vertices: ByteArray,
-        offset: Int,
+        vertices: Int,
         size: Int,
         vertexCount: Int,
     ) {
         memory.read(this.drawState, drawState, this.drawState.size)
+        val bytes = copy(memory, vertices, size)
         this.drawState.usePinned { state ->
-            vertices.usePinned { pinned -> oot_gpu_draw(gpu, state.addressOf(0), pinned.addressOf(offset), size, vertexCount) }
+            bytes.usePinned { pinned -> oot_gpu_draw(gpu, state.addressOf(0), pinned.addressOf(0), size, vertexCount) }
         }
     }
 
@@ -137,6 +141,36 @@ class IosWebGpuRenderer(
         x: Float,
         y: Float,
     ): Int = oot_gpu_depth(gpu, targetId, x, y)
+
+    override fun readDepths(
+        targetId: Int,
+        memory: HostMemory,
+        coordinates: Int,
+        count: Int,
+        destination: Int,
+    ) {
+        if (count <= 0) return
+        val points = copy(memory, coordinates, count * 8)
+        val size = count * 4
+        if (readback.size < size) readback = ByteArray(size)
+        points.usePinned { input ->
+            readback.usePinned { output ->
+                oot_gpu_depths(gpu, targetId, input.addressOf(0).reinterpret(), count, output.addressOf(0).reinterpret())
+            }
+        }
+        memory.write(destination, readback, 0, size)
+    }
+
+    // Chasm's iOS memory has no borrow API, so guest data is copied into one reused array.
+    private fun copy(
+        memory: HostMemory,
+        pointer: Int,
+        size: Int,
+    ): ByteArray {
+        if (guest.size < size) guest = ByteArray(maxOf(size, guest.size * 2))
+        memory.read(guest, pointer, size)
+        return guest
+    }
 
     override fun close() = oot_gpu_destroy(gpu)
 

@@ -130,7 +130,7 @@ target_link_options(
     -Wl,--export=oot_set_audio_volumes
     -Wl,--export=oot_shutdown
     $<$<BOOL:${OOT_RENDER_TRACE}>:-Wl,--export=oot_trace_frame>
-    $<$<OR:$<BOOL:${OOT_RENDER_TRACE}>,$<BOOL:${OOT_PROFILE}>>:-Wl,--export=oot_trace_entrance>
+    -Wl,--export=oot_trace_entrance
     -Wl,--export=oot_stub_count
     -Wl,--export=oot_stub_calls
     -Wl,--export=oot_stub_name

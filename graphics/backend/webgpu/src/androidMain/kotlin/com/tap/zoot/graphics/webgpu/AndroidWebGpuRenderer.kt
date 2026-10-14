@@ -1,22 +1,15 @@
 package com.tap.zoot.graphics.webgpu
 
 import android.view.Surface
-import androidx.webgpu.BufferUsage
-import androidx.webgpu.GPUBufferDescriptor
-import androidx.webgpu.GPUColor
+import androidx.webgpu.GPUBuffer
+import androidx.webgpu.GPUCommandBuffer
 import androidx.webgpu.GPUCommandEncoder
 import androidx.webgpu.GPUExtent3D
-import androidx.webgpu.GPURenderPassColorAttachment
-import androidx.webgpu.GPURenderPassDepthStencilAttachment
-import androidx.webgpu.GPURenderPassDescriptor
 import androidx.webgpu.GPURenderPassEncoder
 import androidx.webgpu.GPUTexelCopyBufferInfo
 import androidx.webgpu.GPUTexelCopyBufferLayout
 import androidx.webgpu.GPUTexelCopyTextureInfo
-import androidx.webgpu.LoadOp
 import androidx.webgpu.MapMode
-import androidx.webgpu.StoreOp
-import androidx.webgpu.TextureFormat
 import com.tap.zoot.graphics.DrawState
 import com.tap.zoot.graphics.Renderer
 import com.tap.zoot.graphics.RendererFrameMetrics
@@ -26,7 +19,6 @@ import dev.zacsweers.metro.AssistedFactory
 import dev.zacsweers.metro.AssistedInject
 import io.github.charlietap.chasm.host.HostMemory
 import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 /** Translates already-decoded draw batches into WebGPU calls. No N64 commands enter this class. */
 @AssistedInject
@@ -35,31 +27,41 @@ class AndroidWebGpuRenderer(
     @Assisted width: Int,
     @Assisted height: Int,
     @Assisted upscaler: Upscaler,
+    settings: WebGpuSettings,
 ) : Renderer {
-    private val context = AndroidWebGpuContext(surface, width, height)
+    private val context = AndroidWebGpuContext(surface, width, height, settings)
     private val device = context.device
     private val queue = context.queue
     private val counters = FrameCounters()
     private val samplers = Samplers(device)
-    private val uploads = FrameUploads(device)
-    private val bindGroups = BindGroups(device, samplers, uploads.uniformBuffer)
-    private val pipelines = DrawPipelines(device, bindGroups.layout)
+    private val uploads = VertexUploads(device)
     private val textureStaging = TextureStaging()
+    private val bindGroups = BindGroups(device, samplers, counters)
+    private val pipelines = DrawPipelines(context, bindGroups.layout, PipelineHistory(settings.pipelineHistory), counters)
     private val blitter = TargetBlitter(device, samplers)
+    private val readbacks = ReadbackBuffer(device)
+    private var depthProbe: DepthProbe? = null
     private var presentation = PresentationRenderer(device, context.format, upscaler)
     private val presentations = mutableMapOf(upscaler to presentation)
     private val textures = HashMap<Int, GpuImage>()
     private val targets = HashMap<Int, RenderTarget>()
-    private val dynamicOffset = IntArray(1)
+    private val clears = PendingClears()
+    private val bindings = PassBindings()
+    private val drawState = GuestBytes()
+    private val guestData = GuestBytes()
     private var encoder: GPUCommandEncoder? = null
+    private var submission: Array<GPUCommandBuffer>? = null
     private var pass: GPURenderPassEncoder? = null
     private var passTarget = NO_TARGET
 
     override val frameMetrics: RendererFrameMetrics
         get() = counters
 
+    override val deviceDescription: String
+        get() = context.description
+
     init {
-        uploadTexture(WHITE_TEXTURE, byteArrayOf(-1, -1, -1, -1), 0, 1, 1)
+        upload(WHITE_TEXTURE, guestData.wrap(byteArrayOf(-1, -1, -1, -1)), 1, 1)
     }
 
     override fun createShader(
@@ -71,31 +73,34 @@ class AndroidWebGpuRenderer(
 
     override fun uploadTexture(
         textureId: Int,
-        pixels: ByteArray,
-        offset: Int,
+        memory: HostMemory,
+        pixels: Int,
+        width: Int,
+        height: Int,
+    ) {
+        val start = System.nanoTime()
+        upload(textureId, guestData.load(memory, pixels, width * height * 4), width, height)
+        counters.stagingNanos += System.nanoTime() - start
+        counters.uploadBytes += width * height * 4
+        counters.textureUploads++
+    }
+
+    private fun upload(
+        textureId: Int,
+        source: GuestBytes,
         width: Int,
         height: Int,
     ) {
         val image =
             textures[textureId]?.takeIf { it.hasSize(width, height) } ?: device.createImage(width, height).also {
-                bindGroups.clear()
+                bindGroups.evictTexture(textureId)
                 textures.put(textureId, it)?.close()
             }
-        val length = width * height * 4
-        val stagingStart = System.nanoTime()
-        val staged = textureStaging.stage(pixels, offset, length)
-        counters.uploadBytes += length
-        counters.stagingNanos += System.nanoTime() - stagingStart
-        queue.writeTexture(
-            GPUTexelCopyTextureInfo(image.texture),
-            staged,
-            GPUExtent3D(width, height),
-            GPUTexelCopyBufferLayout(bytesPerRow = width * 4, rowsPerImage = height),
-        )
+        textureStaging.upload(queue, image.texture, source, width, height)
     }
 
     override fun deleteTexture(textureId: Int) {
-        bindGroups.clear()
+        bindGroups.evictTexture(textureId)
         textures.remove(textureId)?.close()
     }
 
@@ -105,72 +110,80 @@ class AndroidWebGpuRenderer(
         height: Int,
     ) {
         if (targets[targetId]?.color?.hasSize(width, height) == true) return
-        endPass()
-        bindGroups.clear()
-        targets.remove(targetId)?.close()
-        targets[targetId] = RenderTarget(device.createImage(width, height), device.createImage(width, height, TextureFormat.Depth32Float))
+        if (passTarget == targetId) endPass()
+        bindGroups.evictTarget(targetId)
+        targets.remove(targetId)?.let {
+            blitter.forget(it.color)
+            depthProbe?.forget(it.depth)
+            it.close()
+        }
+        targets[targetId] = device.createTarget(width, height)
     }
 
     override fun beginFrame() {
+        context.checkDevice()
         check(encoder == null)
         counters.reset()
         uploads.reset()
         encoder = device.createCommandEncoder()
     }
 
+    /** Clears are folded into the target's next pass as its load operations. */
     override fun clearTarget(
         targetId: Int,
         clearColour: Boolean,
         clearDepth: Boolean,
     ) {
-        endPass()
-        beginPass(targetId, clearColour, clearDepth)
-        endPass()
+        if (passTarget == targetId) endPass()
+        clears.request(targetId, clearColour, clearDepth)
     }
 
     override fun draw(
         memory: HostMemory,
         drawState: Int,
-        vertices: ByteArray,
-        offset: Int,
+        vertices: Int,
         size: Int,
         vertexCount: Int,
     ) {
-        val shaderId = memory.readI32(drawState + DrawState.SHADER)
-        val flags = memory.readI32(drawState + DrawState.FLAGS)
-        val targetId = memory.readI32(drawState + DrawState.TARGET)
+        val state = this.drawState.load(memory, drawState, DrawState.SIZE)
+        val targetId = state.int(DrawState.TARGET)
         val target = targets.getValue(targetId).color
-        val scissorHeight = memory.readI32(drawState + DrawState.SCISSOR_HEIGHT)
-        val clipX = memory.readI32(drawState + DrawState.SCISSOR_X).coerceIn(0, target.width)
-        val clipY = (target.height - memory.readI32(drawState + DrawState.SCISSOR_Y) - scissorHeight).coerceIn(0, target.height)
-        val clipWidth = memory.readI32(drawState + DrawState.SCISSOR_WIDTH).coerceIn(0, target.width - clipX)
+        val scissorHeight = state.int(DrawState.SCISSOR_HEIGHT)
+        val clipX = state.int(DrawState.SCISSOR_X).coerceIn(0, target.width)
+        val clipY = (target.height - state.int(DrawState.SCISSOR_Y) - scissorHeight).coerceIn(0, target.height)
+        val clipWidth = state.int(DrawState.SCISSOR_WIDTH).coerceIn(0, target.width - clipX)
         val clipHeight = scissorHeight.coerceIn(0, target.height - clipY)
         if (clipWidth == 0 || clipHeight == 0 || vertexCount == 0) return
-        check(uploads.fits(size))
+        val shaderId = state.int(DrawState.SHADER)
         val stagingStart = System.nanoTime()
-        uploads.stage(memory, drawState, vertices, offset, size)
+        val data = guestData.load(memory, vertices, size)
+        val firstVertex = uploads.stage(data.bytes, data.offset, size, pipelines.stride(shaderId))
         counters.stagingNanos += System.nanoTime() - stagingStart
-        counters.uploadBytes += size + DrawState.UNIFORMS_SIZE
-        val pipeline = pipelines[shaderId, flags]
-        val bindGroup = bindGroups.find(memory, drawState) ?: bindGroups.createForProbe(::bindingImage)
+        counters.uploadBytes += size
+        val pipeline = pipelines[shaderId, state.int(DrawState.FLAGS)]
+        val bindGroup = bindGroups.find(state) ?: bindGroups.createForProbe(::bindingImage)
+        clearSampledTargets()
         if (passTarget != targetId) {
             endPass()
             beginPass(targetId)
         }
         val pass = checkNotNull(pass)
-        pass.setPipeline(pipeline)
-        dynamicOffset[0] = uploads.uniformOffset.toInt()
-        pass.setBindGroup(0, bindGroup, dynamicOffset)
-        pass.setVertexBuffer(0, uploads.vertexBuffer, uploads.vertexOffset, size.toLong())
-        val viewportX = memory.readI32(drawState + DrawState.VIEWPORT_X).toFloat()
-        val viewportY = memory.readI32(drawState + DrawState.VIEWPORT_Y).toFloat()
-        val viewportWidth = memory.readI32(drawState + DrawState.VIEWPORT_WIDTH).toFloat()
-        val viewportHeight = memory.readI32(drawState + DrawState.VIEWPORT_HEIGHT).toFloat()
-        pass.setViewport(viewportX, target.height - viewportY - viewportHeight, viewportWidth, viewportHeight, 0f, 1f)
-        pass.setScissorRect(clipX, clipY, clipWidth, clipHeight)
-        pass.draw(vertexCount)
-        uploads.advance(size)
+        bindings.pipeline(pass, pipeline)
+        bindings.bindGroup(pass, bindGroup)
+        bindings.vertices(pass, uploads.buffer)
+        bindings.params(pass, state)
+        bindings.viewport(pass, state, target.height)
+        bindings.scissor(pass, clipX, clipY, clipWidth, clipHeight)
+        pass.draw(vertexCount, 1, firstVertex, 0)
         counters.draws++
+    }
+
+    // A target sampled by this draw must have its pending clear applied before the draw's pass.
+    private fun clearSampledTargets() {
+        for (slot in 0 until DrawState.TEXTURE_SLOTS) {
+            val texture = bindGroups.probedTexture(slot)
+            if (texture < 0) flushClear(texture and Int.MAX_VALUE)
+        }
     }
 
     override fun copyTarget(
@@ -178,12 +191,10 @@ class AndroidWebGpuRenderer(
         sourceId: Int,
     ) {
         endPass()
-        blitter.blit(
-            checkNotNull(encoder),
-            targets.getValue(sourceId).color,
-            targets.getValue(destinationId).color.view,
-            TextureFormat.RGBA8Unorm,
-        )
+        flushClear(sourceId)
+        // The blit replaces all of the destination's colour, so only a pending depth clear survives.
+        clears.dropColour(destinationId)
+        blitter.blit(checkNotNull(encoder), targets.getValue(sourceId).color, targets.getValue(destinationId).color.view)
     }
 
     override fun setUpscaler(upscaler: Upscaler) {
@@ -192,6 +203,7 @@ class AndroidWebGpuRenderer(
 
     override fun endFrame() {
         endPass()
+        for (targetId in clears.targets) flushClear(targetId)
         val acquireStart = System.nanoTime()
         val current = context.surface.getCurrentTexture()
         counters.acquireNanos += System.nanoTime() - acquireStart
@@ -203,6 +215,8 @@ class AndroidWebGpuRenderer(
         counters.presentNanos += System.nanoTime() - presentStart
         texture.close()
         context.processEvents()
+        pipelines.warm()
+        pipelines.saveHistory()
     }
 
     override fun readTargetRgba16(
@@ -213,10 +227,21 @@ class AndroidWebGpuRenderer(
         destination: Int,
     ) {
         val image = targets.getValue(targetId).color
-        val pixels = readback(image)
+        val stride = (image.width * 4 + 255) and -256
+        val size = stride * image.height
+        val buffer = readbacks.buffer(size)
+        val pixels =
+            roundTrip(targetId, buffer, size) { encoder ->
+                encoder.copyTextureToBuffer(
+                    GPUTexelCopyTextureInfo(image.texture),
+                    GPUTexelCopyBufferInfo(buffer, GPUTexelCopyBufferLayout(bytesPerRow = stride, rowsPerImage = image.height)),
+                    GPUExtent3D(image.width, image.height),
+                )
+            }
         for (y in 0 until height) {
+            val row = (y * image.height / height) * stride
             for (x in 0 until width) {
-                val pixel = pixels.getInt(((y * image.height / height) * image.width + x * image.width / width) * 4)
+                val pixel = pixels.getInt(row + (x * image.width / width) * 4)
                 memory.writeI16(destination + (y * width + x) * 2, rgba5551(pixel).toShort())
             }
         }
@@ -228,12 +253,44 @@ class AndroidWebGpuRenderer(
         y: Float,
     ): Int {
         val image = targets[targetId]?.depth ?: return NO_DEPTH
-        // Readback is an explicit device operation, not Fast3D decoding.
-        val depths = readback(image)
-        val column = x.toInt().coerceIn(0, image.width - 1)
-        val row = (image.height - 1 - y.toInt()).coerceIn(0, image.height - 1)
-        return encodeDepth(depths.getFloat((row * image.width + column) * 4))
+        val probe = depthProbe()
+        probe.point(0, column(image, x), row(image, y))
+        return encodeDepth(probe(probe, targetId, image, 1).getFloat(0))
     }
+
+    override fun readDepths(
+        targetId: Int,
+        memory: HostMemory,
+        coordinates: Int,
+        count: Int,
+        destination: Int,
+    ) {
+        val image = targets[targetId]?.depth
+        if (image == null) {
+            repeat(count) { memory.writeI32(destination + it * 4, NO_DEPTH) }
+            return
+        }
+        val probe = depthProbe()
+        for (start in 0 until count step DepthProbe.BATCH) {
+            val batch = minOf(DepthProbe.BATCH, count - start)
+            for (index in 0 until batch) {
+                val point = coordinates + (start + index) * 8
+                probe.point(index, column(image, memory.readF32(point)), row(image, memory.readF32(point + 4)))
+            }
+            val depths = probe(probe, targetId, image, batch)
+            for (index in 0 until batch) memory.writeI32(destination + (start + index) * 4, encodeDepth(depths.getFloat(index * 4)))
+        }
+    }
+
+    // Created on the first depth query; many scenes never make one.
+    private fun depthProbe(): DepthProbe = depthProbe ?: DepthProbe(device).also { depthProbe = it }
+
+    private fun probe(
+        probe: DepthProbe,
+        targetId: Int,
+        image: GpuImage,
+        count: Int,
+    ): ByteBuffer = roundTrip(targetId, probe.results, count * 4) { probe.encode(it, image, count) }
 
     private fun bindingImage(textureId: Int): GpuImage =
         if (textureId < 0) {
@@ -242,62 +299,34 @@ class AndroidWebGpuRenderer(
             textures[textureId] ?: textures.getValue(WHITE_TEXTURE)
         }
 
-    private fun readback(image: GpuImage): ByteBuffer {
+    /** Submits work so far plus [encode], then waits for [buffer] and returns its first [size] bytes. */
+    private inline fun roundTrip(
+        targetId: Int,
+        buffer: GPUBuffer,
+        size: Int,
+        encode: (GPUCommandEncoder) -> Unit,
+    ): ByteBuffer {
+        val start = System.nanoTime()
         val inFrame = encoder != null
         endPass()
-        val encoder = encoder ?: device.createCommandEncoder().also { encoder = it }
-        val stride = (image.width * 4 + 255) and -256
-        val size = stride * image.height
-        val buffer = device.createBuffer(GPUBufferDescriptor(usage = BufferUsage.CopyDst or BufferUsage.MapRead, size = size.toLong()))
-        encoder.copyTextureToBuffer(
-            GPUTexelCopyTextureInfo(image.texture),
-            GPUTexelCopyBufferInfo(buffer, GPUTexelCopyBufferLayout(bytesPerRow = stride, rowsPerImage = image.height)),
-            GPUExtent3D(image.width, image.height),
-        )
+        if (!inFrame) encoder = device.createCommandEncoder()
+        flushClear(targetId)
+        encode(checkNotNull(encoder))
         submit()
         context.request<Unit> { callback -> buffer.mapAsync(MapMode.Read, 0, size.toLong(), context.executor, callback) }
-        val mapped = buffer.getConstMappedRange(0, size.toLong())
-        val output = ByteBuffer.allocate(image.width * image.height * 4).order(ByteOrder.LITTLE_ENDIAN)
-        repeat(image.height) { row ->
-            mapped.position(row * stride)
-            mapped.limit(row * stride + image.width * 4)
-            output.put(mapped)
-            mapped.limit(size)
-        }
+        val result = readbacks.read(buffer, size)
         buffer.unmap()
-        buffer.close()
-        if (inFrame) this.encoder = device.createCommandEncoder()
-        return output
+        if (inFrame) encoder = device.createCommandEncoder()
+        counters.readbacks++
+        counters.readbackNanos += System.nanoTime() - start
+        return result
     }
 
-    private fun beginPass(
-        targetId: Int,
-        clearColour: Boolean = false,
-        clearDepth: Boolean = false,
-    ) {
-        val target = targets.getValue(targetId)
-        pass =
-            checkNotNull(encoder).beginRenderPass(
-                GPURenderPassDescriptor(
-                    colorAttachments =
-                        arrayOf(
-                            GPURenderPassColorAttachment(
-                                view = target.color.view,
-                                loadOp = if (clearColour) LoadOp.Clear else LoadOp.Load,
-                                storeOp = StoreOp.Store,
-                                clearValue = GPUColor(0.0, 0.0, 0.0, 1.0),
-                            ),
-                        ),
-                    depthStencilAttachment =
-                        GPURenderPassDepthStencilAttachment(
-                            view = target.depth.view,
-                            depthLoadOp = if (clearDepth) LoadOp.Clear else LoadOp.Load,
-                            depthStoreOp = StoreOp.Store,
-                            depthClearValue = 1f,
-                        ),
-                ),
-            )
+    private fun beginPass(targetId: Int) {
+        pass = checkNotNull(encoder).beginRenderPass(targets.getValue(targetId).pass(clears.take(targetId)))
         passTarget = targetId
+        bindings.reset()
+        counters.passes++
     }
 
     private fun endPass() {
@@ -309,6 +338,14 @@ class AndroidWebGpuRenderer(
         passTarget = NO_TARGET
     }
 
+    /** Applies a pending clear with an otherwise empty pass, for targets used before they are drawn to. */
+    private fun flushClear(targetId: Int) {
+        if (!clears.has(targetId) || !targets.containsKey(targetId)) return
+        endPass()
+        beginPass(targetId)
+        endPass()
+    }
+
     private fun submit() {
         val uploadStart = System.nanoTime()
         uploads.flush(queue)
@@ -317,7 +354,9 @@ class AndroidWebGpuRenderer(
         val commands = checkNotNull(encoder).finish()
         counters.finishNanos += System.nanoTime() - finishStart
         val submitStart = System.nanoTime()
-        commands.use { queue.submit(arrayOf(it)) }
+        val submission = submission?.also { it[0] = commands } ?: arrayOf(commands).also { submission = it }
+        queue.submit(submission)
+        commands.close()
         counters.submitNanos += System.nanoTime() - submitStart
         encoder?.close()
         encoder = null
@@ -326,12 +365,14 @@ class AndroidWebGpuRenderer(
     override fun close() {
         endPass()
         encoder?.close()
-        bindGroups.clear()
+        pipelines.saveHistory()
         presentations.values.forEach(PresentationRenderer::close)
         targets.values.forEach(RenderTarget::close)
         textures.values.forEach(GpuImage::close)
         pipelines.close()
         blitter.close()
+        depthProbe?.close()
+        readbacks.close()
         samplers.close()
         uploads.close()
         bindGroups.close()
@@ -353,6 +394,16 @@ class AndroidWebGpuRenderer(
         const val SCREEN_TARGET = 0
         const val NO_TARGET = -1
         const val NO_DEPTH = 65532
+
+        fun column(
+            image: GpuImage,
+            x: Float,
+        ) = x.toInt().coerceIn(0, image.width - 1)
+
+        fun row(
+            image: GpuImage,
+            y: Float,
+        ) = (image.height - 1 - y.toInt()).coerceIn(0, image.height - 1)
 
         fun rgba5551(pixel: Int): Int =
             ((pixel and 255) shr 3 shl 11) or (((pixel ushr 8) and 255) shr 3 shl 6) or (((pixel ushr 16) and 255) shr 3 shl 1) or

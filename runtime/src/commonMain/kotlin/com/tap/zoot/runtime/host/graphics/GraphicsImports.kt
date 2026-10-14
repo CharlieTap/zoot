@@ -2,7 +2,6 @@ package com.tap.zoot.runtime.host.graphics
 
 import com.tap.zoot.graphics.Renderer
 import com.tap.zoot.runtime.engine.HostTimings
-import com.tap.zoot.runtime.host.GuestMemoryTransfer
 import com.tap.zoot.runtime.host.HostImportGroup
 import com.tap.zoot.runtime.host.functionImport
 import com.tap.zoot.runtime.host.i32
@@ -10,11 +9,9 @@ import com.tap.zoot.runtime.platform.monotonicNanos
 import dev.zacsweers.metro.Inject
 import io.github.charlietap.chasm.embedding.codegen.CodegenImport
 import io.github.charlietap.chasm.host.HostFunction
-import io.github.charlietap.chasm.host.readF32
 import io.github.charlietap.chasm.host.readI32
 import io.github.charlietap.chasm.host.readUtf8String
 import io.github.charlietap.chasm.host.withMemory
-import io.github.charlietap.chasm.host.writeI32
 
 /** Direct guest graphics callbacks. */
 @Inject
@@ -22,8 +19,6 @@ internal class GraphicsImports(
     private val renderer: Renderer,
     private val timings: HostTimings,
 ) : HostImportGroup {
-    private val transfer = GuestMemoryTransfer()
-
     override val imports: List<CodegenImport> =
         listOf(
             functionImport(
@@ -56,13 +51,13 @@ internal class GraphicsImports(
                     HostFunction { parameters, _ ->
                         withMemory(0) {
                             measured {
-                                val textureId = parameters.readI32(0)
-                                val pixelsPointer = parameters.readI32(1)
-                                val width = parameters.readI32(2)
-                                val height = parameters.readI32(3)
-                                transfer.read(this, pixelsPointer, width * height * 4) { pixels ->
-                                    renderer.uploadTexture(textureId, pixels, 0, width, height)
-                                }
+                                renderer.uploadTexture(
+                                    textureId = parameters.readI32(0),
+                                    memory = this,
+                                    pixels = parameters.readI32(1),
+                                    width = parameters.readI32(2),
+                                    height = parameters.readI32(3),
+                                )
                             }
                         }
                     },
@@ -81,13 +76,13 @@ internal class GraphicsImports(
                     HostFunction { parameters, _ ->
                         withMemory(0) {
                             measured {
-                                val drawState = parameters.readI32(0)
-                                val verticesPointer = parameters.readI32(1)
-                                val verticesSize = parameters.readI32(2)
-                                val vertexCount = parameters.readI32(3)
-                                transfer.read(this, verticesPointer, verticesSize) { vertices ->
-                                    renderer.draw(this, drawState, vertices, 0, verticesSize, vertexCount)
-                                }
+                                renderer.draw(
+                                    memory = this,
+                                    drawState = parameters.readI32(0),
+                                    vertices = parameters.readI32(1),
+                                    size = parameters.readI32(2),
+                                    vertexCount = parameters.readI32(3),
+                                )
                             }
                         }
                     },
@@ -163,23 +158,20 @@ internal class GraphicsImports(
             ),
             functionImport(
                 GPU,
-                "depth",
-                parameterTypes = {
-                    i32()
-                    f32()
-                    f32()
-                },
-                resultTypes = { i32() },
+                "depth_batch",
+                parameterTypes = { i32(4) },
                 function =
-                    HostFunction { parameters, results ->
-                        measured {
-                            val depth =
-                                renderer.readDepth(
+                    HostFunction { parameters, _ ->
+                        withMemory(0) {
+                            measured {
+                                renderer.readDepths(
                                     targetId = parameters.readI32(0),
-                                    x = parameters.readF32(1),
-                                    y = parameters.readF32(2),
+                                    memory = this,
+                                    coordinates = parameters.readI32(1),
+                                    count = parameters.readI32(2),
+                                    destination = parameters.readI32(3),
                                 )
-                            results.writeI32(0, depth)
+                            }
                         }
                     },
             ),

@@ -101,9 +101,11 @@ class DefaultGameController(
         mutableState.value = GameState.Starting
         telemetry.reset()
         var started = false
+        var gpu: String? = null
         try {
             val initial = configuration.filterNotNull().first()
             rendererFactory.create(initial.upscaler).use { renderer ->
+                gpu = renderer.deviceDescription
                 engineFactory.create(renderer).use { engine ->
                     started = true
                     SessionLoop(engine, renderer, benchmark).run()
@@ -114,7 +116,7 @@ class DefaultGameController(
         } catch (failure: Throwable) {
             logger.error("Game failed", failure)
             input.releaseAll()
-            val report = CrashReport(failure, crashEnvironment.environment(), crashReporting)
+            val report = CrashReport(failure, crashEnvironment.environment().copy(gpu = gpu), crashReporting)
             mutableState.value = GameState.Failed(report, duringStartup = !started)
         }
     }

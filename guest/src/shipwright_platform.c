@@ -231,14 +231,13 @@ void Graph_ProcessGfxCommands(Gfx* commands) {
     OotRenderer_Run(commands);
 }
 
-#if OOT_RENDER_TRACE || OOT_PROFILE
 void oot_trace_entrance(uint32_t entrance) {
     extern PlayState* gPlayState;
+    if (gPlayState == NULL) return;
     gPlayState->nextEntranceIndex = entrance;
     gPlayState->transitionTrigger = TRANS_TRIGGER_START;
     gPlayState->transitionType = TRANS_TYPE_FADE_BLACK;
 }
-#endif
 
 #if OOT_RENDER_TRACE
 void OotTrace_PrintScene(void) {

@@ -2,6 +2,7 @@
 #include "fast/reference_trace.h"
 #include "fast/backends/gfx_window_manager_api.h"
 #include <tuple>
+#include <vector>
 extern "C" {
 #if OOT_PROFILE
 __attribute__((import_module("oot_profile"), import_name("fast3d"))) void Host_ProfileFast3d(uint32_t);
@@ -16,7 +17,7 @@ GPU_IMPORT("target") void Host_Target(uint32_t, uint32_t, uint32_t);
 GPU_IMPORT("clear") void Host_Clear(uint32_t, uint32_t, uint32_t);
 GPU_IMPORT("copy") void Host_Copy(uint32_t, uint32_t);
 GPU_IMPORT("read") void Host_Read(uint32_t, uint32_t, uint32_t, uint16_t *);
-GPU_IMPORT("depth") uint32_t Host_Depth(uint32_t, float, float);
+GPU_IMPORT("depth_batch") void Host_DepthBatch(uint32_t, const float *, uint32_t, uint32_t *);
 }
 namespace {
 // Plain little-endian Wasm32 ABI; all pointers are borrowed for the host call only.
@@ -148,8 +149,17 @@ class Renderer final : public Fast::GfxRenderingAPI {
     std::unordered_map<std::pair<float, float>, uint16_t, Fast::hash_pair_ff>
     GetPixelDepth(int id, const std::set<std::pair<float, float>> &coords) override {
         std::unordered_map<std::pair<float, float>, uint16_t, Fast::hash_pair_ff> result;
+        std::vector<float> points;
+        points.reserve(coords.size() * 2);
+        for (auto p : coords) {
+            points.push_back(p.first);
+            points.push_back(p.second);
+        }
+        std::vector<uint32_t> depths(coords.size());
+        Host_DepthBatch(id, points.data(), coords.size(), depths.data());
+        size_t i = 0;
         for (auto p : coords)
-            result[p] = Host_Depth(id, p.first, p.second);
+            result[p] = depths[i++];
         return result;
     }
     void *GetFramebufferTextureId(int id) override { return reinterpret_cast<void *>(0x80000000u | id); }

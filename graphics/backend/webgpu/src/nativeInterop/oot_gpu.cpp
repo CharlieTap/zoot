@@ -48,6 +48,34 @@ struct Output { @builtin(position) position: vec4f, @location(0) uv: vec2f };
 @fragment fn fragmentMain(input: Output) -> @location(0) vec4f {
     return textureSampleLevel(image, imageSampler, input.uv, 0.0);
 })";
+// Four ints the open pass already has, so repeated state is not re-encoded.
+struct Bound {
+    std::array<int, 4> values{};
+    bool valid = false;
+    bool update(const std::array<int, 4> &next) {
+        if (valid && values == next) return false;
+        values = next; valid = true;
+        return true;
+    }
+};
+constexpr uint32_t kDrawImmediates = 16;
+constexpr uint32_t kProbeImmediates = 64;
+constexpr int kProbeBatch = 64;
+constexpr int kProbesPerDispatch = 6;
+const char *probeSource = R"(
+struct Probe { header: vec4u, first: vec4u, second: vec4u, third: vec4u }
+var<immediate> probe: Probe;
+@group(0) @binding(0) var depth: texture_depth_2d;
+@group(0) @binding(1) var<storage, read_write> depths: array<f32, 64>;
+@compute @workgroup_size(8) fn main(@builtin(local_invocation_index) index: u32) {
+    if (index < probe.header.x) {
+        var pair = probe.third;
+        if (index < 2u) { pair = probe.first; } else if (index < 4u) { pair = probe.second; }
+        let point = select(pair.xy, pair.zw, (index & 1u) == 1u);
+        depths[probe.header.y + index] = textureLoad(depth, point, 0);
+    }
+})";
+int encodeDepth(float depth) { return (int(std::clamp(depth, 0.0f, 1.0f) * 0xffffff) >> 10) << 2; }
 }
 
 struct OotGpu {
@@ -57,15 +85,24 @@ struct OotGpu {
     WGPUDevice device = nullptr;
     WGPUQueue queue = nullptr;
     WGPUTextureFormat format = WGPUTextureFormat_BGRA8Unorm;
-    WGPUBuffer vertices = nullptr, uniforms = nullptr;
+    WGPUBuffer vertices = nullptr;
     WGPUBindGroupLayout layout = nullptr;
     WGPUPipelineLayout pipelineLayout = nullptr;
     WGPUCommandEncoder command = nullptr;
     WGPURenderPassEncoder pass = nullptr;
     int passTarget = -1;
-    size_t vertexOffset = 0, uniformOffset = 0;
+    size_t vertexOffset = 0, flushedOffset = 0;
     std::vector<uint8_t> vertexUpload = std::vector<uint8_t>(16 * 1024 * 1024);
-    std::vector<uint8_t> uniformUpload = std::vector<uint8_t>(4 * 1024 * 1024);
+    // What the open pass already has bound, so unchanged state is not re-encoded.
+    WGPURenderPipeline boundPipeline = nullptr;
+    WGPUBindGroup boundGroup = nullptr;
+    bool boundVertices = false;
+    Bound boundParams, boundViewport, boundScissor;
+    WGPUComputePipeline probePipeline = nullptr;
+    WGPUBindGroupLayout probeLayout = nullptr;
+    WGPUPipelineLayout probePipelineLayout = nullptr;
+    WGPUBuffer probeOutput = nullptr, probeResults = nullptr;
+    std::unordered_map<WGPUTextureView, WGPUBindGroup> probeGroups;
     std::unordered_map<int, Image> textures;
     std::unordered_map<int, Target> targets;
     std::unordered_map<int, Shader> shaders;
@@ -159,6 +196,7 @@ struct OotGpu {
     void clearBindings() {
         for (auto &entry : bindings) wgpuBindGroupRelease(entry.second);
         bindings.clear();
+        boundGroup = nullptr;
         // Texture views may be replaced when the guest recreates a target.
         for (auto &entry : presentations) entry.second.source = nullptr;
         blit.source = nullptr;
@@ -181,12 +219,14 @@ struct OotGpu {
         descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &color;
         descriptor.depthStencilAttachment = &depth;
         pass = wgpuCommandEncoderBeginRenderPass(command, &descriptor); passTarget = id;
+        boundPipeline = nullptr; boundGroup = nullptr; boundVertices = false;
+        boundParams.valid = boundViewport.valid = boundScissor.valid = false;
     }
 
     void submit() {
-        if (vertexOffset) {
-            wgpuQueueWriteBuffer(queue, vertices, 0, vertexUpload.data(), vertexOffset);
-            wgpuQueueWriteBuffer(queue, uniforms, 0, uniformUpload.data(), uniformOffset);
+        if (vertexOffset > flushedOffset) {
+            wgpuQueueWriteBuffer(queue, vertices, flushedOffset, vertexUpload.data() + flushedOffset, vertexOffset - flushedOffset);
+            flushedOffset = vertexOffset;
         }
         auto commands = wgpuCommandEncoderFinish(command, nullptr);
         wgpuQueueSubmit(queue, 1, &commands);
@@ -227,6 +267,84 @@ struct OotGpu {
         if (inFrame) command = wgpuDeviceCreateCommandEncoder(device, nullptr);
         return output;
     }
+
+    // WebGPU only copies whole depth subresources, so a compute pass loads single texels instead.
+    void createProbe() {
+        WGPUBindGroupLayoutEntry entries[2] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
+        entries[0].binding = 0; entries[0].visibility = WGPUShaderStage_Compute;
+        entries[0].texture.sampleType = WGPUTextureSampleType_Depth; entries[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+        entries[1].binding = 1; entries[1].visibility = WGPUShaderStage_Compute;
+        entries[1].buffer.type = WGPUBufferBindingType_Storage;
+        WGPUBindGroupLayoutDescriptor layout = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+        layout.entryCount = 2; layout.entries = entries;
+        probeLayout = wgpuDeviceCreateBindGroupLayout(device, &layout);
+        WGPUPipelineLayoutExtras extras = {};
+        extras.chain.sType = (WGPUSType)WGPUSType_PipelineLayoutExtras; extras.immediateDataSize = kProbeImmediates;
+        WGPUPipelineLayoutDescriptor pipeline = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+        pipeline.nextInChain = &extras.chain; pipeline.bindGroupLayoutCount = 1; pipeline.bindGroupLayouts = &probeLayout;
+        probePipelineLayout = wgpuDeviceCreatePipelineLayout(device, &pipeline);
+        auto shader = module(probeSource);
+        WGPUComputePipelineDescriptor descriptor = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+        descriptor.layout = probePipelineLayout; descriptor.compute.module = shader; descriptor.compute.entryPoint = text("main");
+        probePipeline = wgpuDeviceCreateComputePipeline(device, &descriptor);
+        wgpuShaderModuleRelease(shader);
+        probeOutput = buffer(kProbeBatch * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
+        probeResults = buffer(kProbeBatch * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
+    }
+
+    void probeDepths(const Image &depth, const int *columns, const int *rows, int count, float *out) {
+        if (!probePipeline) createProbe();
+        auto group = probeGroups.find(depth.view);
+        if (group == probeGroups.end()) {
+            WGPUBindGroupEntry entries[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+            entries[0].binding = 0; entries[0].textureView = depth.view;
+            entries[1].binding = 1; entries[1].buffer = probeOutput; entries[1].size = kProbeBatch * 4;
+            WGPUBindGroupDescriptor descriptor = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+            descriptor.layout = probeLayout; descriptor.entryCount = 2; descriptor.entries = entries;
+            group = probeGroups.emplace(depth.view, wgpuDeviceCreateBindGroup(device, &descriptor)).first;
+        }
+        bool inFrame = command != nullptr;
+        endPass();
+        if (!command) command = wgpuDeviceCreateCommandEncoder(device, nullptr);
+        auto compute = wgpuCommandEncoderBeginComputePass(command, nullptr);
+        wgpuComputePassEncoderSetPipeline(compute, probePipeline);
+        wgpuComputePassEncoderSetBindGroup(compute, 0, group->second, 0, nullptr);
+        for (int base = 0; base < count; base += kProbesPerDispatch) {
+            int size = std::min(kProbesPerDispatch, count - base);
+            uint32_t immediates[kProbeImmediates / 4] = {uint32_t(size), uint32_t(base), 0, 0};
+            for (int i = 0; i < kProbesPerDispatch; i++) {
+                int point = base + std::min(i, size - 1);
+                immediates[4 + i * 2] = columns[point]; immediates[5 + i * 2] = rows[point];
+            }
+            wgpuComputePassEncoderSetImmediates(compute, 0, sizeof(immediates), immediates);
+            wgpuComputePassEncoderDispatchWorkgroups(compute, 1, 1, 1);
+        }
+        wgpuComputePassEncoderEnd(compute);
+        wgpuComputePassEncoderRelease(compute);
+        wgpuCommandEncoderCopyBufferToBuffer(command, probeOutput, 0, probeResults, 0, count * 4);
+        submit();
+        std::atomic<int> status{0};
+        WGPUBufferMapCallbackInfo callback = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+        callback.mode = WGPUCallbackMode_AllowSpontaneous; callback.userdata1 = &status;
+        callback.callback = [](WGPUMapAsyncStatus result, WGPUStringView message, void *context, void *) {
+            if (result != WGPUMapAsyncStatus_Success) fprintf(stderr, "Zoot depth probe: %.*s\n", int(message.length), message.data);
+            static_cast<std::atomic<int> *>(context)->store(result == WGPUMapAsyncStatus_Success ? 1 : -1);
+        };
+        wgpuBufferMapAsync(probeResults, WGPUMapMode_Read, 0, count * 4, callback);
+        while (!status.load()) wgpuDevicePoll(device, true, nullptr);
+        if (status.load() == 1) {
+            memcpy(out, wgpuBufferGetConstMappedRange(probeResults, 0, count * 4), count * 4);
+            wgpuBufferUnmap(probeResults);
+        } else {
+            std::fill(out, out + count, 1.0f);
+        }
+        if (inFrame) command = wgpuDeviceCreateCommandEncoder(device, nullptr);
+    }
+
+    void forgetProbe(const Image &depth) {
+        auto group = probeGroups.find(depth.view);
+        if (group != probeGroups.end()) { wgpuBindGroupRelease(group->second); probeGroups.erase(group); }
+    }
 };
 
 OotGpu *oot_gpu_create(void *layer, int width, int height) {
@@ -252,6 +370,16 @@ OotGpu *oot_gpu_create(void *layer, int width, int height) {
     if (!gpu->adapter) { wgpuSurfaceRelease(gpu->surface); wgpuInstanceRelease(gpu->instance); delete gpu; return nullptr; }
     ready.store(false);
     WGPUDeviceDescriptor device = WGPU_DEVICE_DESCRIPTOR_INIT;
+    WGPUFeatureName immediates = (WGPUFeatureName)WGPUNativeFeature_Immediates;
+    device.requiredFeatureCount = 1; device.requiredFeatures = &immediates;
+    WGPUNativeLimits nativeLimits = {};
+    nativeLimits.chain.sType = (WGPUSType)WGPUSType_NativeLimits;
+    nativeLimits.maxImmediateSize = kProbeImmediates;
+    nativeLimits.maxNonSamplerBindings = WGPU_LIMIT_U32_UNDEFINED;
+    nativeLimits.maxBindingArrayElementsPerShaderStage = WGPU_LIMIT_U32_UNDEFINED;
+    WGPULimits limits = WGPU_LIMITS_INIT;
+    limits.nextInChain = &nativeLimits.chain;
+    device.requiredLimits = &limits;
     device.uncapturedErrorCallbackInfo.callback = [](WGPUDevice const *, WGPUErrorType, WGPUStringView message, void *, void *) {
         fprintf(stderr, "Zoot GPU: %.*s\n", int(message.length), message.data);
     };
@@ -273,22 +401,21 @@ OotGpu *oot_gpu_create(void *layer, int width, int height) {
     configuration.alphaMode = WGPUCompositeAlphaMode_Opaque;
     wgpuSurfaceConfigure(gpu->surface, &configuration);
     gpu->vertices = gpu->buffer(gpu->vertexUpload.size(), WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst);
-    gpu->uniforms = gpu->buffer(gpu->uniformUpload.size(), WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
-    WGPUBindGroupLayoutEntry entries[13];
+    WGPUBindGroupLayoutEntry entries[12];
     for (auto &entry : entries) entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
-    entries[0].binding = 0; entries[0].visibility = WGPUShaderStage_Fragment;
-    entries[0].buffer.type = WGPUBufferBindingType_Uniform;
-    entries[0].buffer.hasDynamicOffset = true; entries[0].buffer.minBindingSize = 16;
     for (int i = 0; i < 6; i++) {
-        auto &texture = entries[1 + i * 2]; texture.binding = 1 + i * 2; texture.visibility = WGPUShaderStage_Fragment;
+        auto &texture = entries[i * 2]; texture.binding = 1 + i * 2; texture.visibility = WGPUShaderStage_Fragment;
         texture.texture.sampleType = WGPUTextureSampleType_Float; texture.texture.viewDimension = WGPUTextureViewDimension_2D;
-        auto &sampler = entries[2 + i * 2]; sampler.binding = 2 + i * 2; sampler.visibility = WGPUShaderStage_Fragment;
+        auto &sampler = entries[1 + i * 2]; sampler.binding = 2 + i * 2; sampler.visibility = WGPUShaderStage_Fragment;
         sampler.sampler.type = WGPUSamplerBindingType_Filtering;
     }
     WGPUBindGroupLayoutDescriptor layout = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
-    layout.entryCount = 13; layout.entries = entries;
+    layout.entryCount = 12; layout.entries = entries;
     gpu->layout = wgpuDeviceCreateBindGroupLayout(gpu->device, &layout);
+    WGPUPipelineLayoutExtras extras = {};
+    extras.chain.sType = (WGPUSType)WGPUSType_PipelineLayoutExtras; extras.immediateDataSize = kDrawImmediates;
     WGPUPipelineLayoutDescriptor pipeline = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    pipeline.nextInChain = &extras.chain;
     pipeline.bindGroupLayoutCount = 1; pipeline.bindGroupLayouts = &gpu->layout;
     gpu->pipelineLayout = wgpuDeviceCreatePipelineLayout(gpu->device, &pipeline);
     gpu->blit = gpu->makePresentation(blitSource, WGPUTextureFormat_RGBA8Unorm, false);
@@ -334,12 +461,12 @@ void oot_gpu_target(OotGpu *gpu, int id, int width, int height) {
     auto found = gpu->targets.find(id);
     if (found != gpu->targets.end() && found->second.color.width == width && found->second.color.height == height) return;
     gpu->endPass(); gpu->clearBindings();
-    if (found != gpu->targets.end()) found->second.close();
+    if (found != gpu->targets.end()) { gpu->forgetProbe(found->second.depth); found->second.close(); }
     gpu->targets[id] = {gpu->image(width, height), gpu->image(width, height, WGPUTextureFormat_Depth32Float)};
 }
 
 void oot_gpu_begin(OotGpu *gpu) {
-    gpu->vertexOffset = gpu->uniformOffset = 0;
+    gpu->vertexOffset = gpu->flushedOffset = 0;
     gpu->command = wgpuDeviceCreateCommandEncoder(gpu->device, nullptr);
 }
 
@@ -354,13 +481,13 @@ void oot_gpu_draw(OotGpu *gpu, const void *rawState, const void *data, int size,
     int x = std::clamp(state[7], 0, target.width), y = std::clamp(target.height - state[8] - state[10], 0, target.height);
     int w = std::clamp(state[9], 0, target.width - x), h = std::clamp(state[10], 0, target.height - y);
     if (!w || !h || !count) return;
-    if (size < 0 || gpu->vertexOffset + size > gpu->vertexUpload.size() ||
-        gpu->uniformOffset + 256 > gpu->uniformUpload.size()) {
+    size_t stride = gpu->shaders.at(id).stride;
+    size_t start = (gpu->vertexOffset + stride - 1) / stride * stride;
+    if (size < 0 || start + size > gpu->vertexUpload.size()) {
         fprintf(stderr, "Zoot GPU: frame upload capacity exceeded\n");
         std::abort();
     }
-    memcpy(gpu->vertexUpload.data() + gpu->vertexOffset, data, size);
-    memcpy(gpu->uniformUpload.data() + gpu->uniformOffset, state + 23, 16);
+    memcpy(gpu->vertexUpload.data() + start, data, size);
     uint64_t pipelineKey = (uint64_t(uint32_t(id)) << 32) | uint32_t(flags);
     auto pipeline = gpu->pipelines.find(pipelineKey);
     if (pipeline == gpu->pipelines.end()) {
@@ -389,29 +516,36 @@ void oot_gpu_draw(OotGpu *gpu, const void *rawState, const void *data, int size,
     std::array<int, 12> key; memcpy(key.data(), state + 11, sizeof(key));
     auto binding = gpu->bindings.find(key);
     if (binding == gpu->bindings.end()) {
-        WGPUBindGroupEntry entries[13];
+        WGPUBindGroupEntry entries[12];
         for (auto &entry : entries) entry = WGPU_BIND_GROUP_ENTRY_INIT;
-        entries[0].binding = 0; entries[0].buffer = gpu->uniforms; entries[0].size = 16;
         for (int tile = 0; tile < 6; tile++) {
             int textureId = key[tile];
             auto &image = textureId < 0 ? gpu->targets.at(textureId & 0x7fffffff).color :
                 gpu->textures.at(gpu->textures.count(textureId) ? textureId : 0);
-            entries[1 + tile * 2].binding = 1 + tile * 2; entries[1 + tile * 2].textureView = image.view;
-            entries[2 + tile * 2].binding = 2 + tile * 2; entries[2 + tile * 2].sampler = gpu->sampler(key[6 + tile]);
+            entries[tile * 2].binding = 1 + tile * 2; entries[tile * 2].textureView = image.view;
+            entries[1 + tile * 2].binding = 2 + tile * 2; entries[1 + tile * 2].sampler = gpu->sampler(key[6 + tile]);
         }
         WGPUBindGroupDescriptor descriptor = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-        descriptor.layout = gpu->layout; descriptor.entryCount = 13; descriptor.entries = entries;
+        descriptor.layout = gpu->layout; descriptor.entryCount = 12; descriptor.entries = entries;
         binding = gpu->bindings.emplace(key, wgpuDeviceCreateBindGroup(gpu->device, &descriptor)).first;
     }
     if (gpu->passTarget != targetId) { gpu->endPass(); gpu->beginPass(targetId); }
-    wgpuRenderPassEncoderSetPipeline(gpu->pass, pipeline->second);
-    uint32_t offset = gpu->uniformOffset;
-    wgpuRenderPassEncoderSetBindGroup(gpu->pass, 0, binding->second, 1, &offset);
-    wgpuRenderPassEncoderSetVertexBuffer(gpu->pass, 0, gpu->vertices, gpu->vertexOffset, size);
-    wgpuRenderPassEncoderSetViewport(gpu->pass, state[3], target.height - state[4] - state[6], state[5], state[6], 0, 1);
-    wgpuRenderPassEncoderSetScissorRect(gpu->pass, x, y, w, h);
-    wgpuRenderPassEncoderDraw(gpu->pass, count, 1, 0, 0);
-    gpu->vertexOffset += size; gpu->uniformOffset += 256;
+    if (gpu->boundPipeline != pipeline->second) {
+        wgpuRenderPassEncoderSetPipeline(gpu->pass, pipeline->second); gpu->boundPipeline = pipeline->second;
+    }
+    if (gpu->boundGroup != binding->second) {
+        wgpuRenderPassEncoderSetBindGroup(gpu->pass, 0, binding->second, 0, nullptr); gpu->boundGroup = binding->second;
+    }
+    if (!gpu->boundVertices) {
+        wgpuRenderPassEncoderSetVertexBuffer(gpu->pass, 0, gpu->vertices, 0, WGPU_WHOLE_SIZE); gpu->boundVertices = true;
+    }
+    if (gpu->boundParams.update({state[23], state[24], state[25], state[26]}))
+        wgpuRenderPassEncoderSetImmediates(gpu->pass, 0, kDrawImmediates, gpu->boundParams.values.data());
+    if (gpu->boundViewport.update({state[3], state[4], state[5], state[6]}))
+        wgpuRenderPassEncoderSetViewport(gpu->pass, state[3], target.height - state[4] - state[6], state[5], state[6], 0, 1);
+    if (gpu->boundScissor.update({x, y, w, h})) wgpuRenderPassEncoderSetScissorRect(gpu->pass, x, y, w, h);
+    wgpuRenderPassEncoderDraw(gpu->pass, count, 1, uint32_t(start / stride), 0);
+    gpu->vertexOffset = start + size;
 }
 
 void oot_gpu_copy(OotGpu *gpu, int destination, int source) {
@@ -450,12 +584,26 @@ void oot_gpu_read(OotGpu *gpu, int id, int width, int height, void *destination)
 }
 
 int oot_gpu_depth(OotGpu *gpu, int id, float x, float y) {
-    if (!gpu->targets.count(id)) return 65532;
+    float point[2] = {x, y};
+    int depth;
+    oot_gpu_depths(gpu, id, point, 1, &depth);
+    return depth;
+}
+
+void oot_gpu_depths(OotGpu *gpu, int id, const float *points, int count, int *out) {
+    if (!gpu->targets.count(id)) { std::fill(out, out + count, 65532); return; }
     auto &image = gpu->targets.at(id).depth;
-    auto data = gpu->readback(image);
-    int ix = std::clamp(int(x), 0, image.width - 1), iy = std::clamp(image.height - 1 - int(y), 0, image.height - 1);
-    float value; memcpy(&value, data.data() + (iy * image.width + ix) * 4, 4);
-    return (int(std::clamp(value, 0.0f, 1.0f) * 0xffffff) >> 10) << 2;
+    int columns[kProbeBatch], rows[kProbeBatch];
+    float depths[kProbeBatch];
+    for (int done = 0; done < count; done += kProbeBatch) {
+        int batch = std::min(kProbeBatch, count - done);
+        for (int i = 0; i < batch; i++) {
+            columns[i] = std::clamp(int(points[(done + i) * 2]), 0, image.width - 1);
+            rows[i] = std::clamp(image.height - 1 - int(points[(done + i) * 2 + 1]), 0, image.height - 1);
+        }
+        gpu->probeDepths(image, columns, rows, batch, depths);
+        for (int i = 0; i < batch; i++) out[done + i] = encodeDepth(depths[i]);
+    }
 }
 
 void oot_gpu_destroy(OotGpu *gpu) {
@@ -469,7 +617,12 @@ void oot_gpu_destroy(OotGpu *gpu) {
     for (auto &entry : gpu->pipelines) wgpuRenderPipelineRelease(entry.second);
     for (auto &entry : gpu->shaders) wgpuShaderModuleRelease(entry.second.module);
     for (auto &entry : gpu->samplers) wgpuSamplerRelease(entry.second);
-    wgpuBufferRelease(gpu->vertices); wgpuBufferRelease(gpu->uniforms);
+    for (auto &entry : gpu->probeGroups) wgpuBindGroupRelease(entry.second);
+    if (gpu->probePipeline) {
+        wgpuComputePipelineRelease(gpu->probePipeline); wgpuPipelineLayoutRelease(gpu->probePipelineLayout);
+        wgpuBindGroupLayoutRelease(gpu->probeLayout); wgpuBufferRelease(gpu->probeOutput); wgpuBufferRelease(gpu->probeResults);
+    }
+    wgpuBufferRelease(gpu->vertices);
     wgpuBindGroupLayoutRelease(gpu->layout); wgpuPipelineLayoutRelease(gpu->pipelineLayout);
     wgpuQueueRelease(gpu->queue); wgpuSurfaceUnconfigure(gpu->surface); wgpuSurfaceRelease(gpu->surface);
     wgpuDeviceRelease(gpu->device); wgpuAdapterRelease(gpu->adapter); wgpuInstanceRelease(gpu->instance);

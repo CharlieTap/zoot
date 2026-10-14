@@ -31,6 +31,7 @@ fun CrashReport(
             appendLine("Wasm SHA-256: ${environment.wasmSha256 ?: UNKNOWN}")
             appendLine("Platform: ${environment.platform} ${environment.osVersion ?: UNKNOWN}")
             appendLine("Device: ${environment.deviceModel ?: UNKNOWN}")
+            appendLine("GPU: ${environment.gpu ?: UNKNOWN}")
             appendLine()
             append(trap?.toString() ?: "$summary (no Wasm stack trace)")
         }

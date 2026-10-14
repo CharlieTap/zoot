@@ -48,7 +48,7 @@ void BuildShader(ShaderProgram &shader) {
     std::string src = in + "};\n" + out + "};\n";
     src += "@vertex fn vertexMain(v: Vin) -> Vout { var o: Vout; " + assign + "return o; }\n";
     src += "struct Params { depth: f32, frame: f32, noiseScale: f32, filtering: u32 };\n";
-    src += "@group(0) @binding(0) var<uniform> params: Params;\n";
+    src += "var<immediate> params: Params;\n";
     for (int t = 0; t < 6; t++) {
         src += "@group(0) @binding(" + std::to_string(1 + t * 2) + ") var tex" + std::to_string(t) +
                ": texture_2d<f32>;\n";

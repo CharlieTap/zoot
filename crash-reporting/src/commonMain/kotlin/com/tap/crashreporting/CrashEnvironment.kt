@@ -8,4 +8,5 @@ data class CrashEnvironment(
     val platform: String,
     val osVersion: String?,
     val deviceModel: String?,
+    val gpu: String? = null,
 )

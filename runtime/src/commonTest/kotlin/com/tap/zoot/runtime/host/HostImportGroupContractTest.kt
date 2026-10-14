@@ -35,7 +35,7 @@ class HostImportGroupContractTest {
                 "oot_gpu.clear",
                 "oot_gpu.copy",
                 "oot_gpu.read",
-                "oot_gpu.depth",
+                "oot_gpu.depth_batch",
             ),
             GraphicsImports(TestRenderer(), HostTimings()).imports.names(),
         )

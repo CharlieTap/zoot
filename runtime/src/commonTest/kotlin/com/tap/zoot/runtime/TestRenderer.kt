@@ -16,8 +16,8 @@ internal class TestRenderer : Renderer {
 
     override fun uploadTexture(
         textureId: Int,
-        pixels: ByteArray,
-        offset: Int,
+        memory: HostMemory,
+        pixels: Int,
         width: Int,
         height: Int,
     ) = Unit
@@ -41,8 +41,7 @@ internal class TestRenderer : Renderer {
     override fun draw(
         memory: HostMemory,
         drawState: Int,
-        vertices: ByteArray,
-        offset: Int,
+        vertices: Int,
         size: Int,
         vertexCount: Int,
     ) = Unit
@@ -69,6 +68,14 @@ internal class TestRenderer : Renderer {
         x: Float,
         y: Float,
     ): Int = 0
+
+    override fun readDepths(
+        targetId: Int,
+        memory: HostMemory,
+        coordinates: Int,
+        count: Int,
+        destination: Int,
+    ) = Unit
 
     override fun close() {
         closed = true

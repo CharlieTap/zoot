@@ -1,5 +1,6 @@
 package com.tap.zoot.graphics.webgpu
 
+import androidx.webgpu.GPUBindGroup
 import androidx.webgpu.GPUBindGroupDescriptor
 import androidx.webgpu.GPUBindGroupEntry
 import androidx.webgpu.GPUColor
@@ -9,7 +10,6 @@ import androidx.webgpu.GPUDevice
 import androidx.webgpu.GPUFragmentState
 import androidx.webgpu.GPURenderPassColorAttachment
 import androidx.webgpu.GPURenderPassDescriptor
-import androidx.webgpu.GPURenderPipeline
 import androidx.webgpu.GPURenderPipelineDescriptor
 import androidx.webgpu.GPUShaderModuleDescriptor
 import androidx.webgpu.GPUShaderSourceWGSL
@@ -17,32 +17,40 @@ import androidx.webgpu.GPUTextureView
 import androidx.webgpu.GPUVertexState
 import androidx.webgpu.LoadOp
 import androidx.webgpu.StoreOp
+import androidx.webgpu.TextureFormat
+import java.util.IdentityHashMap
 
 internal class TargetBlitter(
     private val device: GPUDevice,
     private val samplers: Samplers,
 ) : AutoCloseable {
     private val shader = device.createShaderModule(GPUShaderModuleDescriptor(shaderSourceWGSL = GPUShaderSourceWGSL(BLIT_SHADER)))
-    private val pipelines = HashMap<Int, GPURenderPipeline>()
+    private val pipeline =
+        device.createRenderPipeline(
+            GPURenderPipelineDescriptor(
+                vertex = GPUVertexState(shader, "vertexMain"),
+                fragment = GPUFragmentState(shader, "fragmentMain", targets = arrayOf(GPUColorTargetState(TextureFormat.RGBA8Unorm))),
+            ),
+        )
+    private val layout = pipeline.getBindGroupLayout(0)
+    private val groups = IdentityHashMap<GpuImage, GPUBindGroup>()
+    private val attachment =
+        GPURenderPassColorAttachment(
+            clearValue = GPUColor(0.0, 0.0, 0.0, 1.0),
+            loadOp = LoadOp.Clear,
+            storeOp = StoreOp.Store,
+        )
+    private val passDescriptor = GPURenderPassDescriptor(colorAttachments = arrayOf(attachment))
 
+    /** Draws [source] over all of [destination], an RGBA8 view, replacing its contents. */
     fun blit(
         encoder: GPUCommandEncoder,
         source: GpuImage,
         destination: GPUTextureView,
-        format: Int,
     ) {
-        val pipeline =
-            pipelines.getOrPut(format) {
-                device.createRenderPipeline(
-                    GPURenderPipelineDescriptor(
-                        vertex = GPUVertexState(shader, "vertexMain"),
-                        fragment = GPUFragmentState(shader, "fragmentMain", targets = arrayOf(GPUColorTargetState(format))),
-                    ),
-                )
-            }
-        pipeline.getBindGroupLayout(0).use { layout ->
-            device
-                .createBindGroup(
+        val group =
+            groups.getOrPut(source) {
+                device.createBindGroup(
                     GPUBindGroupDescriptor(
                         layout = layout,
                         entries =
@@ -51,32 +59,25 @@ internal class TargetBlitter(
                                 GPUBindGroupEntry(1, sampler = samplers[Samplers.CLAMPED]),
                             ),
                     ),
-                ).use { group ->
-                    encoder
-                        .beginRenderPass(
-                            GPURenderPassDescriptor(
-                                colorAttachments =
-                                    arrayOf(
-                                        GPURenderPassColorAttachment(
-                                            view = destination,
-                                            loadOp = LoadOp.Clear,
-                                            storeOp = StoreOp.Store,
-                                            clearValue = GPUColor(0.0, 0.0, 0.0, 1.0),
-                                        ),
-                                    ),
-                            ),
-                        ).use { pass ->
-                            pass.setPipeline(pipeline)
-                            pass.setBindGroup(0, group)
-                            pass.draw(3)
-                            pass.end()
-                        }
-                }
+                )
+            }
+        attachment.view = destination
+        encoder.beginRenderPass(passDescriptor).use { pass ->
+            pass.setPipeline(pipeline)
+            pass.setBindGroup(0, group, NO_OFFSETS)
+            pass.draw(3)
+            pass.end()
         }
     }
 
+    fun forget(source: GpuImage) {
+        groups.remove(source)?.close()
+    }
+
     override fun close() {
-        pipelines.values.forEach(GPURenderPipeline::close)
+        groups.values.forEach(GPUBindGroup::close)
+        layout.close()
+        pipeline.close()
         shader.close()
     }
 }

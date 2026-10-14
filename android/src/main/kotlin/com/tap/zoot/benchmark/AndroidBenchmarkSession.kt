@@ -45,7 +45,7 @@ internal class AndroidBenchmarkSession(
         val cpuNanos = Debug.threadCpuTimeNanos() - cpuStartedNanos
         Log.i(
             TAG,
-            buildString(256) {
+            buildString(320) {
                 append(configuration.label)
                 append(',').append(tick)
                 append(',').append(stepNanos)
@@ -65,6 +65,13 @@ internal class AndroidBenchmarkSession(
                 append(',').append(totalNanos)
                 append(',').append(cpuNanos)
                 append(',').append(finishedNanos)
+                append(',').append(metrics.readbacks)
+                append(',').append(metrics.readbackNanos)
+                append(',').append(metrics.pipelinesCreated)
+                append(',').append(metrics.pipelineNanos)
+                append(',').append(metrics.bindGroupsCreated)
+                append(',').append(metrics.passes)
+                append(',').append(metrics.textureUploads)
             },
         )
         val complete = tick >= configuration.ticks

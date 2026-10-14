@@ -7,12 +7,12 @@ import androidx.webgpu.GPUBlendComponent
 import androidx.webgpu.GPUBlendState
 import androidx.webgpu.GPUColorTargetState
 import androidx.webgpu.GPUDepthStencilState
-import androidx.webgpu.GPUDevice
 import androidx.webgpu.GPUFragmentState
 import androidx.webgpu.GPUPipelineLayoutDescriptor
 import androidx.webgpu.GPUPrimitiveState
 import androidx.webgpu.GPURenderPipeline
 import androidx.webgpu.GPURenderPipelineDescriptor
+import androidx.webgpu.GPURequestCallback
 import androidx.webgpu.GPUShaderModule
 import androidx.webgpu.GPUShaderModuleDescriptor
 import androidx.webgpu.GPUShaderSourceWGSL
@@ -24,14 +24,27 @@ import androidx.webgpu.PrimitiveTopology
 import androidx.webgpu.TextureFormat
 import androidx.webgpu.VertexFormat
 import com.tap.zoot.graphics.DrawFlags
+import com.tap.zoot.graphics.DrawState
 
+/**
+ * Pipelines belong to shader content, not the guest's shader ids. Shaders from earlier sessions are
+ * rebuilt a few per frame and their pipelines compiled on Dawn's worker threads, ahead of the guest
+ * defining them just before their first draw.
+ */
 internal class DrawPipelines(
-    private val device: GPUDevice,
+    private val context: AndroidWebGpuContext,
     bindGroupLayout: GPUBindGroupLayout,
+    private val history: PipelineHistory,
+    private val counters: FrameCounters,
 ) : AutoCloseable {
-    private val layout = device.createPipelineLayout(GPUPipelineLayoutDescriptor(bindGroupLayouts = arrayOf(bindGroupLayout)))
+    private val device = context.device
+    private val layout =
+        device.createPipelineLayout(
+            GPUPipelineLayoutDescriptor(bindGroupLayouts = arrayOf(bindGroupLayout), immediateSize = DrawState.UNIFORMS_SIZE),
+        )
+    private val library = HashMap<Long, DrawShader>()
     private val shaders = HashMap<Int, DrawShader>()
-    private val pipelines = HashMap<Long, GPURenderPipeline>()
+    private val unwarmed = ArrayDeque(history.load().entries)
 
     fun defineShader(
         shaderId: Int,
@@ -39,9 +52,58 @@ internal class DrawPipelines(
         vertexStride: Int,
         attributeSizes: IntArray,
     ) {
+        val key = PipelineHistory.key(wgsl, vertexStride)
+        val known = library[key]?.takeIf { it.entry.wgsl == wgsl }
+        shaders[shaderId] = known ?: build(key, PipelineHistory.Entry(wgsl, vertexStride, attributeSizes, HashSet())).also {
+            history.changed(key, it.entry)
+        }
+    }
+
+    fun stride(shaderId: Int): Int = shaders.getValue(shaderId).entry.vertexStride
+
+    operator fun get(
+        shaderId: Int,
+        flags: Int,
+    ): GPURenderPipeline {
+        val shader = shaders.getValue(shaderId)
+        shader.pipelines[flags]?.let { return it }
+        val start = System.nanoTime()
+        shader.warming[flags]?.let { warm -> context.await { warm.done } }
+        val pipeline =
+            shader.pipelines[flags] ?: device.createRenderPipeline(descriptor(shader, flags)).also {
+                shader.pipelines[flags] = it
+                if (shader.entry.flags.add(flags)) history.changed(shader.key, shader.entry)
+            }
+        counters.pipelinesCreated++
+        counters.pipelineNanos += System.nanoTime() - start
+        return pipeline
+    }
+
+    /** Rebuilds a few remembered shaders and starts their pipelines compiling. Called once per frame. */
+    fun warm() {
+        var built = 0
+        while (built < WARM_PER_FRAME) {
+            val (key, entry) = unwarmed.removeFirstOrNull() ?: return
+            if (library.containsKey(key)) continue
+            val shader = build(key, entry)
+            built++
+            for (flags in entry.flags) {
+                val warm = Warming(shader, flags)
+                shader.warming[flags] = warm
+                device.createRenderPipelineAsync(descriptor(shader, flags), context.executor, warm)
+            }
+        }
+    }
+
+    fun saveHistory() = history.save()
+
+    private fun build(
+        key: Long,
+        entry: PipelineHistory.Entry,
+    ): DrawShader {
         var offset = 0L
         val attributes =
-            attributeSizes
+            entry.attributeSizes
                 .mapIndexed { index, components ->
                     GPUVertexAttribute(
                         format = vertexFormat(components),
@@ -49,47 +111,69 @@ internal class DrawPipelines(
                         shaderLocation = index,
                     ).also { offset += components * Float.SIZE_BYTES }
                 }.toTypedArray()
-        shaders[shaderId] =
-            DrawShader(
-                device.createShaderModule(GPUShaderModuleDescriptor(shaderSourceWGSL = GPUShaderSourceWGSL(wgsl))),
-                GPUVertexBufferLayout(arrayStride = vertexStride.toLong(), attributes = attributes),
-            )
+        return DrawShader(
+            key,
+            entry,
+            device.createShaderModule(GPUShaderModuleDescriptor(shaderSourceWGSL = GPUShaderSourceWGSL(entry.wgsl))),
+            GPUVertexBufferLayout(arrayStride = entry.vertexStride.toLong(), attributes = attributes),
+        ).also { library[key] = it }
     }
 
-    operator fun get(
-        shaderId: Int,
-        flags: Int,
-    ): GPURenderPipeline = pipelines.getOrPut((shaderId.toLong() shl 32) or flags.toLong()) { create(shaders.getValue(shaderId), flags) }
-
-    private fun create(
+    private fun descriptor(
         shader: DrawShader,
         flags: Int,
-    ): GPURenderPipeline =
-        device.createRenderPipeline(
-            GPURenderPipelineDescriptor(
-                layout = layout,
-                vertex = GPUVertexState(shader.module, "vertexMain", buffers = arrayOf(shader.vertices)),
-                primitive = GPUPrimitiveState(topology = PrimitiveTopology.TriangleList),
-                depthStencil = depthState(flags),
-                fragment =
-                    GPUFragmentState(
-                        shader.module,
-                        "fragmentMain",
-                        targets = arrayOf(GPUColorTargetState(TextureFormat.RGBA8Unorm, blend = blendState(flags))),
-                    ),
+    ) = GPURenderPipelineDescriptor(
+        layout = layout,
+        vertex = GPUVertexState(shader.module, "vertexMain", buffers = arrayOf(shader.vertices)),
+        primitive = GPUPrimitiveState(topology = PrimitiveTopology.TriangleList),
+        depthStencil = depthState(flags),
+        fragment =
+            GPUFragmentState(
+                shader.module,
+                "fragmentMain",
+                targets = arrayOf(GPUColorTargetState(TextureFormat.RGBA8Unorm, blend = blendState(flags))),
             ),
-        )
+    )
 
     override fun close() {
-        pipelines.values.forEach(GPURenderPipeline::close)
-        shaders.values.forEach { it.module.close() }
+        for (shader in library.values) {
+            shader.pipelines.values.forEach(GPURenderPipeline::close)
+            shader.module.close()
+        }
         layout.close()
     }
 
+    private class Warming(
+        private val shader: DrawShader,
+        private val flags: Int,
+    ) : GPURequestCallback<GPURenderPipeline> {
+        var done = false
+
+        override fun onResult(result: GPURenderPipeline) {
+            done = true
+            shader.warming.remove(flags)
+            if (shader.pipelines.putIfAbsent(flags, result) != null) result.close()
+        }
+
+        override fun onError(exception: Exception) {
+            done = true
+            shader.warming.remove(flags)
+        }
+    }
+
     private class DrawShader(
+        val key: Long,
+        val entry: PipelineHistory.Entry,
         val module: GPUShaderModule,
         val vertices: GPUVertexBufferLayout,
-    )
+    ) {
+        val pipelines = HashMap<Int, GPURenderPipeline>()
+        val warming = HashMap<Int, Warming>()
+    }
+
+    private companion object {
+        const val WARM_PER_FRAME = 4
+    }
 }
 
 private fun vertexFormat(components: Int): Int =

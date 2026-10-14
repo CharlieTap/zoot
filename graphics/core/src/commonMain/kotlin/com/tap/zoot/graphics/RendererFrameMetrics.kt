@@ -10,4 +10,11 @@ interface RendererFrameMetrics {
     val stagingNanos: Long
     val draws: Int
     val uploadBytes: Long
+    val readbacks: Int
+    val readbackNanos: Long
+    val pipelinesCreated: Int
+    val pipelineNanos: Long
+    val bindGroupsCreated: Int
+    val passes: Int
+    val textureUploads: Int
 }

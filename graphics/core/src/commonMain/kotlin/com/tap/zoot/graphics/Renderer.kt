@@ -8,6 +8,9 @@ interface Renderer : AutoCloseable {
     val frameMetrics: RendererFrameMetrics?
         get() = null
 
+    val deviceDescription: String?
+        get() = null
+
     fun createShader(
         shaderId: Int,
         wgsl: String,
@@ -17,8 +20,8 @@ interface Renderer : AutoCloseable {
 
     fun uploadTexture(
         textureId: Int,
-        pixels: ByteArray,
-        offset: Int,
+        memory: HostMemory,
+        pixels: Int,
         width: Int,
         height: Int,
     )
@@ -42,8 +45,7 @@ interface Renderer : AutoCloseable {
     fun draw(
         memory: HostMemory,
         drawState: Int,
-        vertices: ByteArray,
-        offset: Int,
+        vertices: Int,
         size: Int,
         vertexCount: Int,
     )
@@ -70,6 +72,15 @@ interface Renderer : AutoCloseable {
         x: Float,
         y: Float,
     ): Int
+
+    /** Reads [count] (x, y) f32 pairs at [coordinates] and writes one encoded depth i32 each to [destination]. */
+    fun readDepths(
+        targetId: Int,
+        memory: HostMemory,
+        coordinates: Int,
+        count: Int,
+        destination: Int,
+    )
 }
 
 fun interface RendererFactory {

@@ -18,6 +18,8 @@ void oot_gpu_upscaler(OotGpu *gpu, const char *source, int linear);
 void oot_gpu_end(OotGpu *gpu);
 void oot_gpu_read(OotGpu *gpu, int id, int width, int height, void *destination);
 int oot_gpu_depth(OotGpu *gpu, int id, float x, float y);
+// Reads count interleaved (x, y) points and writes one encoded depth per point.
+void oot_gpu_depths(OotGpu *gpu, int id, const float *points, int count, int *out);
 #ifdef __cplusplus
 }
 #endif

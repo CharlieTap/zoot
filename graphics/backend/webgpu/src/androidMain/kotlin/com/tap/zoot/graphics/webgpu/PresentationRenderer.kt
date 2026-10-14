@@ -81,7 +81,7 @@ internal class PresentationRenderer(
         attachment.view = destination
         encoder.beginRenderPass(passDescriptor).use { pass ->
             pass.setPipeline(pipeline)
-            pass.setBindGroup(0, checkNotNull(binding))
+            pass.setBindGroup(0, checkNotNull(binding), NO_OFFSETS)
             pass.draw(3)
             pass.end()
         }
