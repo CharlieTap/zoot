@@ -3,10 +3,6 @@ pluginManagement {
         gradlePluginPortal()
         google()
         mavenCentral()
-        maven("https://central.sonatype.com/repository/maven-snapshots/") {
-            mavenContent { snapshotsOnly() }
-            content { includeGroupByRegex("io\\.github\\.charlietap\\.chasm.*") }
-        }
     }
     includeBuild("gradle/plugins/kotlin-conventions")
     includeBuild("gradle/plugins/linting-conventions")
@@ -22,10 +18,6 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        maven("https://central.sonatype.com/repository/maven-snapshots/") {
-            mavenContent { snapshotsOnly() }
-            content { includeGroupByRegex("io\\.github\\.charlietap\\.chasm.*") }
-        }
     }
 }
 
