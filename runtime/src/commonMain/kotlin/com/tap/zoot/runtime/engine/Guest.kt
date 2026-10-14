@@ -10,9 +10,9 @@ import com.tap.zoot.runtime.resources.GameAsset
 import com.tap.zoot.runtime.resources.GameAssets
 import com.tap.zoot.runtime.resources.writeI32
 import io.github.charlietap.chasm.config.RuntimeConfig
+import io.github.charlietap.chasm.coroutines.instance
 import io.github.charlietap.chasm.embedding.codegen.CodegenImport
 import io.github.charlietap.chasm.embedding.dropStore
-import io.github.charlietap.chasm.embedding.instance
 import io.github.charlietap.chasm.embedding.invoke
 import io.github.charlietap.chasm.embedding.shapes.Instance
 import io.github.charlietap.chasm.embedding.shapes.Store
@@ -32,7 +32,7 @@ internal class Guest(
     private var inputPointer = 0
     private val input = ByteArray(GuestAbi.INPUT_SIZE)
 
-    fun start() {
+    suspend fun start() {
         val started = monotonicNanos()
         module =
             ootWasmModule(

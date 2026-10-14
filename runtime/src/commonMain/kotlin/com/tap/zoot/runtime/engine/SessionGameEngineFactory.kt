@@ -11,7 +11,7 @@ import dev.zacsweers.metro.Inject
 class SessionGameEngineFactory(
     private val sessions: GameSessionGraph.Factory,
 ) : GameEngine.Factory {
-    override fun create(renderer: Renderer): GameEngine {
+    override suspend fun create(renderer: Renderer): GameEngine {
         val engine = sessions.create(renderer).engine
         try {
             engine.start()

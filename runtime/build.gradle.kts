@@ -46,6 +46,7 @@ chasm {
                     runtime = CodegenRuntime.CHASM,
                     wasi = WasiLinking.AUTOMATIC,
                     generateTypesafeMemoryProperties = true,
+                    generateSuspendingFactories = true,
                 ),
             )
             initializers.set(setOf("_initialize"))

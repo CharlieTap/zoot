@@ -13,7 +13,7 @@ import dev.zacsweers.metro.AppScope
 import dev.zacsweers.metro.ContributesBinding
 import dev.zacsweers.metro.Inject
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 
 @Inject
 @ContributesBinding(AppScope::class)
@@ -31,7 +31,7 @@ class IosGameSurface(
                 MetalGameView { surface ->
                     currentFactoryChanged.value(
                         RendererFactory { upscaler ->
-                            runBlocking(Dispatchers.Main.immediate) {
+                            withContext(Dispatchers.Main.immediate) {
                                 renderers.create(surface.layer, surface.width, surface.height, upscaler)
                             }
                         },

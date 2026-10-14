@@ -23,7 +23,7 @@ class ChasmGameEngine internal constructor(
 ) : GameEngine {
     private val guest = Guest(assets, wasiHost, logger, imports.all)
 
-    fun start() {
+    suspend fun start() {
         archive.open()
         guest.start()
     }

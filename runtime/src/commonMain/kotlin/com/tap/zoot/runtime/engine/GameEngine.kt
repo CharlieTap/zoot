@@ -29,6 +29,6 @@ interface GameEngine : AutoCloseable {
     fun resumeAudio()
 
     fun interface Factory {
-        fun create(renderer: Renderer): GameEngine
+        suspend fun create(renderer: Renderer): GameEngine
     }
 }

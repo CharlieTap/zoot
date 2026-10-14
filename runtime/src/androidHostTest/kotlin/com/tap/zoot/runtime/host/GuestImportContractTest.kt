@@ -9,6 +9,7 @@ import io.github.charlietap.chasm.embedding.module
 import io.github.charlietap.chasm.embedding.shapes.Store
 import io.github.charlietap.chasm.embedding.shapes.expect
 import io.github.charlietap.chasm.runtime.type.ExternalType
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Test
@@ -36,26 +37,27 @@ class GuestImportContractTest {
     }
 
     @Test
-    fun shippingGuestInstantiatesWithAutomaticWasiAndTheUnusedProfilerImport() {
-        var store: Store? = null
-        EmbedderHost().use { host ->
-            try {
-                val guest =
-                    ootWasmModule(
-                        binary = binary(),
-                        wasiHost = host,
-                        imports = hostTestImports(),
-                        instanceFactory = { owner, module, imports ->
-                            store = owner
-                            instance(owner, module, imports).expect("Instantiate shipping guest")
-                        },
-                    )
-                assertEquals(3, guest.ootAbiVersion())
-            } finally {
-                store?.let(::dropStore)
+    fun shippingGuestInstantiatesWithAutomaticWasiAndTheUnusedProfilerImport() =
+        runTest {
+            var store: Store? = null
+            EmbedderHost().use { host ->
+                try {
+                    val guest =
+                        ootWasmModule(
+                            binary = binary(),
+                            wasiHost = host,
+                            imports = hostTestImports(),
+                            instanceFactory = { owner, module, imports ->
+                                store = owner
+                                instance(owner, module, imports).expect("Instantiate shipping guest")
+                            },
+                        )
+                    assertEquals(3, guest.ootAbiVersion())
+                } finally {
+                    store?.let(::dropStore)
+                }
             }
         }
-    }
 
     private fun binary() = File(requireNotNull(System.getProperty("guestBinary"))).readBytes()
 }

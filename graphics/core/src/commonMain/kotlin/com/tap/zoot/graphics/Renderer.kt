@@ -73,5 +73,5 @@ interface Renderer : AutoCloseable {
 }
 
 fun interface RendererFactory {
-    fun create(upscaler: Upscaler): Renderer
+    suspend fun create(upscaler: Upscaler): Renderer
 }

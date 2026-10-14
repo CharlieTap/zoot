@@ -19,6 +19,7 @@ import io.github.charlietap.chasm.host.HostFunction
 import io.github.charlietap.chasm.host.readI32
 import io.github.charlietap.chasm.host.withMemory
 import io.github.charlietap.chasm.host.writeI32
+import kotlinx.coroutines.test.runTest
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -34,93 +35,96 @@ class GeneratedGuestModuleTest {
     val temporary = TemporaryFolder()
 
     @Test
-    fun generatedGuestPreservesStartupInputAudioSettingsAndWasi() {
-        val stdout = mutableListOf<String>()
-        val stderr = mutableListOf<String>()
-        val host = host(stdout, stderr)
-        val observedInput = mutableListOf<Int>()
-        var initialisations = 0
-        val imports =
-            imports(
-                initialise = {
-                    initialisations++
-                    0
-                },
-                input =
-                    HostFunction { parameters, results ->
-                        withMemory(0) {
-                            val pointer = parameters.readI32(0)
-                            observedInput.clear()
-                            repeat(5) { observedInput.add(readI32(pointer + it * 4)) }
-                            results.writeI32(0, readI32(pointer + 8))
-                        }
+    fun generatedGuestPreservesStartupInputAudioSettingsAndWasi() =
+        runTest {
+            val stdout = mutableListOf<String>()
+            val stderr = mutableListOf<String>()
+            val host = host(stdout, stderr)
+            val observedInput = mutableListOf<Int>()
+            var initialisations = 0
+            val imports =
+                imports(
+                    initialise = {
+                        initialisations++
+                        0
                     },
-            )
-        guest(host, imports).use { guest ->
-            guest.start()
-            assertEquals(1, initialisations)
-            guest.writeInput(ControllerState.of(buttons = 0x8000, stickX = -40, stickY = 60))
-            assertEquals(0x8000 + 123, guest.step(123))
-            assertEquals(listOf(3, 20, 0x8000, (60 shl 16) or 0xffd8, 0), observedInput)
-            guest.writeInput(ControllerState.of(buttons = 2, stickX = 1, stickY = -2))
-            assertEquals(9, guest.step(7))
-            assertEquals(listOf(3, 20, 2, (-2 shl 16) or 1, 0), observedInput)
-            assertEquals(544, guest.mixAudio(544))
-            assertEquals(528, guest.mixAudio(528))
-            guest.setMixVolumes(0.2f, 0.4f, 0.6f)
-            assertEquals(246, guest.step(-1))
-            assertFails { guest.traceEntrance(529) }
-        }
-        assertEquals(1, host.closes)
-        assertContentEquals(byteArrayOf(1, 2, 3, 4), File(temporary.root, "codegen-test.bin").readBytes())
-        assertTrue(stdout.joinToString("").contains("guest stdout"))
-        assertTrue(stderr.joinToString("").contains("guest stderr"))
-    }
-
-    @Test
-    fun profilingGuestSupportsTheOptionalImportAndDiagnosticExport() {
-        val phases = mutableListOf<Int>()
-        val profiler =
-            FunctionImport(
-                "oot_profile",
-                "fast3d",
-                FunctionTypeBuilder().apply { params { i32() } }.build(),
-                HostFunction { parameters, _ -> phases.add(parameters.readI32(0)) },
-            )
-        guest(host(), imports() + profiler, fixture("guest-profile.wasm")).use { guest ->
-            guest.start()
-            guest.traceEntrance(529)
-            assertEquals(529, guest.step(-2))
-            assertEquals(listOf(0, 1), phases)
-        }
-    }
-
-    @Test
-    fun generatedMemoryReusesBuffersAndHonoursOffsets() {
-        var store: Store? = null
-        host().use { host ->
-            try {
-                val module =
-                    ootWasmModule(
-                        binary = fixture("guest.wasm"),
-                        wasiHost = host,
-                        imports = imports(),
-                        instanceFactory = { owner, decoded, imports ->
-                            store = owner
-                            instance(owner, decoded, imports).expect("Instantiate fixture")
+                    input =
+                        HostFunction { parameters, results ->
+                            withMemory(0) {
+                                val pointer = parameters.readI32(0)
+                                observedInput.clear()
+                                repeat(5) { observedInput.add(readI32(pointer + it * 4)) }
+                                results.writeI32(0, readI32(pointer + 8))
+                            }
                         },
-                    )
-                val pointer = module.ootInputBuffer()
-                val source = byteArrayOf(9, 1, 2, 3, 9)
-                module.memory.write(pointer, source, bufferPointer = 1, bytesToWrite = 3)
-                val destination = ByteArray(5) { 8 }
-                assertSame(destination, module.memory.read(destination, pointer, bufferPointer = 1, bytesToRead = 3))
-                assertContentEquals(byteArrayOf(8, 1, 2, 3, 8), destination)
-            } finally {
-                store?.let(::dropStore)
+                )
+            guest(host, imports).use { guest ->
+                guest.start()
+                assertEquals(1, initialisations)
+                guest.writeInput(ControllerState.of(buttons = 0x8000, stickX = -40, stickY = 60))
+                assertEquals(0x8000 + 123, guest.step(123))
+                assertEquals(listOf(3, 20, 0x8000, (60 shl 16) or 0xffd8, 0), observedInput)
+                guest.writeInput(ControllerState.of(buttons = 2, stickX = 1, stickY = -2))
+                assertEquals(9, guest.step(7))
+                assertEquals(listOf(3, 20, 2, (-2 shl 16) or 1, 0), observedInput)
+                assertEquals(544, guest.mixAudio(544))
+                assertEquals(528, guest.mixAudio(528))
+                guest.setMixVolumes(0.2f, 0.4f, 0.6f)
+                assertEquals(246, guest.step(-1))
+                assertFails { guest.traceEntrance(529) }
+            }
+            assertEquals(1, host.closes)
+            assertContentEquals(byteArrayOf(1, 2, 3, 4), File(temporary.root, "codegen-test.bin").readBytes())
+            assertTrue(stdout.joinToString("").contains("guest stdout"))
+            assertTrue(stderr.joinToString("").contains("guest stderr"))
+        }
+
+    @Test
+    fun profilingGuestSupportsTheOptionalImportAndDiagnosticExport() =
+        runTest {
+            val phases = mutableListOf<Int>()
+            val profiler =
+                FunctionImport(
+                    "oot_profile",
+                    "fast3d",
+                    FunctionTypeBuilder().apply { params { i32() } }.build(),
+                    HostFunction { parameters, _ -> phases.add(parameters.readI32(0)) },
+                )
+            guest(host(), imports() + profiler, fixture("guest-profile.wasm")).use { guest ->
+                guest.start()
+                guest.traceEntrance(529)
+                assertEquals(529, guest.step(-2))
+                assertEquals(listOf(0, 1), phases)
             }
         }
-    }
+
+    @Test
+    fun generatedMemoryReusesBuffersAndHonoursOffsets() =
+        runTest {
+            var store: Store? = null
+            host().use { host ->
+                try {
+                    val module =
+                        ootWasmModule(
+                            binary = fixture("guest.wasm"),
+                            wasiHost = host,
+                            imports = imports(),
+                            instanceFactory = { owner, decoded, imports ->
+                                store = owner
+                                instance(owner, decoded, imports).expect("Instantiate fixture")
+                            },
+                        )
+                    val pointer = module.ootInputBuffer()
+                    val source = byteArrayOf(9, 1, 2, 3, 9)
+                    module.memory.write(pointer, source, bufferPointer = 1, bytesToWrite = 3)
+                    val destination = ByteArray(5) { 8 }
+                    assertSame(destination, module.memory.read(destination, pointer, bufferPointer = 1, bytesToRead = 3))
+                    assertContentEquals(byteArrayOf(8, 1, 2, 3, 8), destination)
+                } finally {
+                    store?.let(::dropStore)
+                }
+            }
+        }
 
     @Test
     fun decodeFailureStillClosesTheWasiHost() = assertStartupFailure(byteArrayOf(0))
@@ -137,7 +141,7 @@ class GeneratedGuestModuleTest {
     private fun assertStartupFailure(
         binary: ByteArray = fixture("guest.wasm"),
         imports: List<CodegenImport> = imports(),
-    ) {
+    ) = runTest {
         val host = host()
         assertFails {
             guest(host, imports, binary).use { it.start() }
