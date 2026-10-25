@@ -234,6 +234,9 @@ void Graph_ProcessGfxCommands(Gfx* commands) {
 void oot_trace_entrance(uint32_t entrance) {
     extern PlayState* gPlayState;
     if (gPlayState == NULL) return;
+    // Warping from the title screen would otherwise load the destination's cutscene layer, which most scenes lack.
+    gSaveContext.gameMode = GAMEMODE_NORMAL;
+    gSaveContext.cutsceneIndex = 0;
     gPlayState->nextEntranceIndex = entrance;
     gPlayState->transitionTrigger = TRANS_TRIGGER_START;
     gPlayState->transitionType = TRANS_TYPE_FADE_BLACK;
